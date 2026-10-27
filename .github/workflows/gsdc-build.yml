@@ -29,7 +29,7 @@ env:
   BUILD_ID: '2'
   LOCAL_VERSION: '_GSDC'
   UPSTREAM: 'https://github.com/dCache/dcache.git'
-  IMAGE: ghcr.io/${{ github.repository_owner }}/dcache
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   detect:

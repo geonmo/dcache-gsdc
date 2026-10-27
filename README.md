@@ -1,6 +1,6 @@
 # GSDC dCache site build
 
-This branch is not part of dCache. It holds the site patches that GSDC applies
+This repository is not part of dCache. It holds the site patches that GSDC applies
 on top of official dCache releases, and the workflow that builds them:
 
 | Path | Purpose |
@@ -18,8 +18,8 @@ from the *Actions* tab), the workflow builds:
 
 - the RPM `dcache-<version>-2_GSDC.noarch.rpm`, attached to the GitHub release
   `<version>-2_GSDC`
-- the image `ghcr.io/geonmo/dcache:<version>-2_GSDC`, and the moving tag
-  `ghcr.io/geonmo/dcache:11.2-gsdc` for the newest release
+- the image `ghcr.io/geonmo/dcache-gsdc:<version>-2_GSDC`, and the moving tag
+  `ghcr.io/geonmo/dcache-gsdc:11.2-gsdc` for the newest release
 
 An official release with a higher version (e.g. `11.2.11-1`) replaces the site
 build when installed. If the patches no longer apply to a new release, the
@@ -41,9 +41,9 @@ If a patch touches another module or defaults file, add it to
 ```ini
 # /etc/containers/systemd/dcache.container
 [Container]
-Image=ghcr.io/geonmo/dcache:11.2.10-2_GSDC
+Image=ghcr.io/geonmo/dcache-gsdc:11.2.10-2_GSDC
 # Alternatively, follow the newest site build with `podman auto-update`:
-# Image=ghcr.io/geonmo/dcache:11.2-gsdc
+# Image=ghcr.io/geonmo/dcache-gsdc:11.2-gsdc
 # AutoUpdate=registry
 ```
 
