@@ -72,13 +72,13 @@ jobs:
     needs: detect
     if: needs.detect.outputs.version != ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
-      issues: write
+    # The image used by dCache's own CI to build RPMs, so that rpmbuild finds
+    # the build dependencies and macros of the spec file.
+    container: docker.io/dcache/maven-java21-rpm-build:latest
+    outputs:
+      patched: ${{ steps.patch.outcome == 'success' }}
     env:
       VERSION: ${{ needs.detect.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out site files
         uses: actions/checkout@v4
@@ -95,23 +95,14 @@ jobs:
           git config user.name "GSDC site build"
           git config user.email "gsdc-build@users.noreply.github.com"
           git am "$GITHUB_WORKSPACE"/site/patches/*.patch
+          git log --reverse --format='- %s' -n "$(ls "$GITHUB_WORKSPACE"/site/patches/*.patch | wc -l)" \
+            > "$GITHUB_WORKSPACE"/patches.txt
 
-      - name: Report patch failure
-        if: failure() && steps.patch.outcome == 'failure'
-        run: |
-          gh issue create -R "$GITHUB_REPOSITORY" \
-            --title "Site patches do not apply to dCache $VERSION" \
-            --body "The patches in \`patches/\` failed to apply to dCache $VERSION. Rebase them onto the $VERSION tag and update the \`gsdc\` branch, then re-run the workflow. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-
-      - uses: actions/setup-java@v4
+      - uses: actions/cache@v4
         with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
-          cache-dependency-path: dcache/pom.xml
-
-      - name: Install rpmbuild
-        run: sudo apt-get update -q && sudo apt-get install -y -q rpm
+          path: ~/.m2/repository
+          key: maven-${{ hashFiles('dcache/**/pom.xml') }}
+          restore-keys: maven-
 
       - name: Run tests of patched code
         working-directory: dcache
@@ -128,10 +119,55 @@ jobs:
           -DskipTests -Dmaven.javadoc.skip=true
           -Dbuild.id="$BUILD_ID" -Dlocal.version="$LOCAL_VERSION"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            dcache/packages/fhs/target/rpmbuild/RPMS/noarch/dcache-*.rpm
+            dcache/packages/tar/target/dcache-*.tar.gz
+            patches.txt
+
+  report-patch-failure:
+    needs: [detect, build]
+    if: failure() && needs.build.outputs.patched != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "Site patches do not apply to dCache $VERSION" \
+            --body "The patches in \`patches/\` failed to apply to dCache $VERSION. Rebase them onto the $VERSION tag and update \`patches/\`, then re-run the workflow. See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+  publish:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out site files
+        uses: actions/checkout@v4
+        with:
+          path: site
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+
       - name: Prepare container overlay
         run: >
           bash site/container/prepare-overlay.sh "$VERSION"
-          dcache/packages/tar/target/dcache-"$VERSION".tar.gz context
+          "$(find packages -name "dcache-$VERSION.tar.gz")" context
 
       - uses: docker/login-action@v3
         with:
@@ -158,11 +194,11 @@ jobs:
           {
             echo "dCache $VERSION with the GSDC site patches:"
             echo
-            git -C dcache log --reverse --format='- %s' -n "$(ls site/patches/*.patch | wc -l)"
+            cat "$(find packages -name patches.txt)"
             echo
             echo "Container image: \`$IMAGE:$release\`"
           } > notes.md
           gh release delete "$release" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2> /dev/null || true
           gh release create "$release" -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" --title "dCache $release" --notes-file notes.md \
-            dcache/packages/fhs/target/rpmbuild/RPMS/noarch/dcache-*.rpm
+            $(find packages -name 'dcache-*.rpm')
