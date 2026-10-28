@@ -1,0 +1,853 @@
+From 750598dacf702556c0ec681e0964096e62b35025 Mon Sep 17 00:00:00 2001
+From: Geonmo Ryu <geonmo@kisti.re.kr>
+Date: Wed, 28 Oct 2026 12:00:13 +0900
+Subject: [PATCH] nfs, xrootd: report the capacity of the pools or a space
+ reservation
+
+Motivation:
+Clients can't see how much space dCache has. The NFS door reports a
+fixed size of 1 EiB, so df on an NFS mount is of no use to users or
+monitoring. The xrootd door doesn't answer kXR_Qspace at all, so
+`xrdfs spaceinfo` fails and df hides xrootdfs mounts (size 0).
+
+Modification:
+Add dcache.capacity.source, inherited by nfs.capacity.source and
+xrootd.capacity.source:
+
+- namespace (default): a fixed 1 EiB, as the NFS door reports today
+- pools: the total and free space of all online pools, counting
+  removable replicas as free, as the frontend does for SRR
+- reservation: the size and available space of a space reservation,
+  given by dcache.capacity.reservation or, for xrootd, by the
+  WriteToken tag of the queried path, as the FTP door does for
+  SITE USAGE
+
+Capacity.Provider computes the value for both doors and logs a failure
+once, until the capacity can be determined again. The NFS door keeps
+the namespace file counts and falls back to the namespace statistics on
+failure. As NFS doesn't tell the door which export a request is for,
+'reservation' needs a space token there, or the door fails to start.
+The xrootd door answers kXR_Qspace in the format of xrootd's oss plugin
+for paths the user can access.
+
+Result:
+By default, NFS is unchanged, and xrootd clients now see 1 EiB, so df
+shows xrootdfs mounts. Disk-only sites can report the capacity of their
+pools, and sites using space reservations the capacity of a reservation.
+
+Fixes: #8275
+Target: master
+Require-book: yes
+Require-notes: yes
+Signed-off-by: Geonmo Ryu <geonmo@kisti.re.kr>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Q2bGtq8WdR49xdKuc2BaVc
+---
+ .../org/dcache/chimera/DCacheAwareJdbcFs.java |  30 ++-
+ .../dcache/chimera/DCacheAwareJdbcFsTest.java | 107 ++++++++++
+ .../chimera/nfsv41/door/nfsv41-common.xml     |  20 ++
+ .../org/dcache/xrootd/door/XrootdDoor.java    |  18 ++
+ .../xrootd/door/XrootdRedirectHandler.java    |  32 +++
+ .../org/dcache/xrootd/door/xrootd.xml         |  19 ++
+ .../xrootd/door/XrootdDoorSpaceQueryTest.java |  55 ++++++
+ .../main/java/org/dcache/space/Capacity.java  | 184 ++++++++++++++++++
+ .../java/org/dcache/space/CapacityTest.java   | 122 ++++++++++++
+ skel/share/defaults/dcache.properties         |  11 ++
+ skel/share/defaults/nfs.properties            |   8 +
+ skel/share/defaults/xrootd.properties         |   8 +
+ 12 files changed, 613 insertions(+), 1 deletion(-)
+ create mode 100644 modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
+ create mode 100644 modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
+ create mode 100644 modules/dcache/src/main/java/org/dcache/space/Capacity.java
+ create mode 100644 modules/dcache/src/test/java/org/dcache/space/CapacityTest.java
+
+diff --git a/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java b/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java
+index 1264ac5..2e9373f 100644
+--- a/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java
++++ b/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java
+@@ -96,6 +96,7 @@ import org.dcache.pinmanager.PinManagerListPinsMessage.Info;
+ import org.dcache.pinmanager.PinManagerPinMessage;
+ import org.dcache.pinmanager.PinManagerUnpinMessage;
+ import org.dcache.poolmanager.RemotePoolMonitor;
++import org.dcache.space.Capacity;
+ import org.dcache.vehicles.FileAttributes;
+ import org.springframework.beans.factory.annotation.Required;
+ import org.springframework.transaction.PlatformTransactionManager;
+@@ -104,7 +105,8 @@ import org.springframework.transaction.PlatformTransactionManager;
+ /**
+  * Overrides protected methods so as to be able to provide live locality information if requested;
+  * the latter calls the PNFS and Pool managers. Also implements requests to pin manager for STAGE
+- * command.
++ * command. Optionally reports the capacity of the pools or a space reservation as file system
++ * statistics.
+  *
+  * @author arossi
+  */
+@@ -177,6 +179,8 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
+      */
+     private RemotePoolMonitor poolMonitor;
+ 
++    private Capacity.Provider capacity;
++
+     @Required
+     public void setQueryPnfsManagerOnRename(boolean yes) {
+         queryPnfsManagerOnRename = yes;
+@@ -208,6 +212,30 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
+         this.poolMonitor = poolMonitor;
+     }
+ 
++    public void setCapacity(Capacity.Provider capacity) {
++        if (capacity.usesWriteToken()) {
++            // NFS doesn't tell the door which export a statfs request is for.
++            throw new IllegalArgumentException(
++                  "nfs.capacity.source=reservation requires nfs.capacity.reservation");
++        }
++        this.capacity = capacity;
++    }
++
++    @Override
++    public FsStat getFsStat() throws ChimeraFsException {
++        FsStat fsStat = super.getFsStat();
++        if (capacity == null || capacity.getSource() == Capacity.Source.NAMESPACE) {
++            return fsStat;
++        }
++        try {
++            Capacity c = capacity.get(null);
++            return new FsStat(c.getTotalSpace(), fsStat.getTotalFiles(), c.getUsedSpace(),
++                  fsStat.getUsedFiles());
++        } catch (CacheException e) {
++            return fsStat; // logged by Capacity.Provider
++        }
++    }
++
+     @Override
+     public void setCellAddress(CellAddressCore address) {
+         myAddress = address;
+diff --git a/modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java b/modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
+new file mode 100644
+index 0000000..470e51d
+--- /dev/null
++++ b/modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
+@@ -0,0 +1,107 @@
++package org.dcache.chimera;
++
++import static org.junit.Assert.assertEquals;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import com.google.common.io.Resources;
++import com.zaxxer.hikari.HikariDataSource;
++import diskCacheV111.util.CacheException;
++import java.io.InputStream;
++import java.net.URL;
++import java.sql.Connection;
++import java.util.Properties;
++import liquibase.Liquibase;
++import liquibase.database.Database;
++import liquibase.database.DatabaseFactory;
++import liquibase.database.jvm.JdbcConnection;
++import liquibase.resource.ClassLoaderResourceAccessor;
++import org.dcache.space.Capacity;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.springframework.jdbc.datasource.DataSourceTransactionManager;
++
++public class DCacheAwareJdbcFsTest {
++
++    private static final URL DB_TEST_PROPERTIES =
++          Resources.getResource("org/dcache/chimera/chimera-test.properties");
++
++    private HikariDataSource dataSource;
++    private DCacheAwareJdbcFs fs;
++    private FsStat namespaceStat;
++
++    @Before
++    public void setUp() throws Exception {
++        Properties dbProperties = new Properties();
++        try (InputStream input = Resources.asByteSource(DB_TEST_PROPERTIES).openStream()) {
++            dbProperties.load(input);
++        }
++
++        dataSource = FsFactory.getDataSource(
++              dbProperties.getProperty("chimera.db.url"),
++              dbProperties.getProperty("chimera.db.user"),
++              dbProperties.getProperty("chimera.db.password"));
++
++        try (Connection conn = dataSource.getConnection()) {
++            Database database = DatabaseFactory.getInstance()
++                  .findCorrectDatabaseImplementation(new JdbcConnection(conn));
++            Liquibase liquibase = new Liquibase("org/dcache/chimera/changelog/changelog-master.xml",
++                  new ClassLoaderResourceAccessor(), database);
++            liquibase.update("");
++        }
++
++        fs = new DCacheAwareJdbcFs(dataSource, new DataSourceTransactionManager(dataSource),
++              "strong");
++        namespaceStat = fs.getFsStat();
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        try (Connection conn = dataSource.getConnection()) {
++            conn.createStatement().execute("SHUTDOWN;");
++        }
++        dataSource.close();
++        fs.close();
++    }
++
++    @Test
++    public void shouldReportNamespaceStatisticsByDefault() throws Exception {
++        assertEquals(JdbcFs.AVAILABLE_SPACE, fs.getFsStat().getTotalSpace());
++    }
++
++    @Test
++    public void shouldReportCapacityOfProvider() throws Exception {
++        Capacity.Provider provider = provider(Capacity.Source.POOLS);
++        when(provider.get(null)).thenReturn(Capacity.UNKNOWN);
++        fs.setCapacity(provider);
++
++        FsStat stat = fs.getFsStat();
++
++        assertEquals(1L << 60, stat.getTotalSpace());
++        assertEquals(0, stat.getUsedSpace());
++        assertEquals(namespaceStat.getUsedFiles(), stat.getUsedFiles());
++    }
++
++    @Test
++    public void shouldFallBackToNamespaceStatistics() throws Exception {
++        Capacity.Provider provider = provider(Capacity.Source.POOLS);
++        when(provider.get(null)).thenThrow(new CacheException("Pool information is not available"));
++        fs.setCapacity(provider);
++
++        assertEquals(namespaceStat.getUsedSpace(), fs.getFsStat().getUsedSpace());
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void shouldRejectReservationOfWriteToken() {
++        Capacity.Provider provider = provider(Capacity.Source.RESERVATION);
++        when(provider.usesWriteToken()).thenReturn(true);
++        fs.setCapacity(provider);
++    }
++
++    private static Capacity.Provider provider(Capacity.Source source) {
++        Capacity.Provider provider = mock(Capacity.Provider.class);
++        when(provider.getSource()).thenReturn(source);
++        return provider;
++    }
++}
+diff --git a/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml b/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml
+index 08c30e8..9245eb9 100644
+--- a/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml
++++ b/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml
+@@ -149,6 +149,26 @@
+ 	<property name="queryPnfsManagerOnRename" value="${nfs.enable.pnfsmanager-query-on-move}"/>
+ 	<property name="quota" ref="quota-system"/>
+ 	<property name="quotaEnabled" value="${nfs.enable.quota}"/>
++        <property name="capacity">
++            <bean class="org.dcache.space.Capacity$Provider">
++                <constructor-arg value="${nfs.capacity.source}"/>
++                <constructor-arg value="${nfs.capacity.reservation}"/>
++                <constructor-arg ref="pool-monitor"/>
++                <constructor-arg>
++                    <bean class="org.dcache.space.ReservationCaches"
++                          factory-method="buildSpaceLookupCache">
++                        <constructor-arg>
++                            <bean class="org.dcache.cells.CellStub">
++                                <property name="destination" value="${nfs.service.spacemanager}"/>
++                                <property name="timeout" value="${nfs.service.spacemanager.timeout}"/>
++                                <property name="timeoutUnit" value="${nfs.service.spacemanager.timeout.unit}"/>
++                            </bean>
++                        </constructor-arg>
++                        <constructor-arg ref="scheduled-thread-pool"/>
++                    </bean>
++                </constructor-arg>
++            </bean>
++        </property>
+ 	<property name="defaultRetentionPolicy" value="#{ T(diskCacheV111.util.RetentionPolicy).getRetentionPolicy('${nfs.default-retention-policy}') }"/>
+ 
+     </bean>
+diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
+index 00e3890..8915392 100644
+--- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
++++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
+@@ -116,6 +116,7 @@ import org.dcache.pinmanager.PinManagerPinMessage;
+ import org.dcache.pinmanager.PinManagerUnpinMessage;
+ import org.dcache.poolmanager.PoolManagerStub;
+ import org.dcache.poolmanager.PoolMonitor;
++import org.dcache.space.Capacity;
+ import org.dcache.util.Checksum;
+ import org.dcache.util.FireAndForgetTask;
+ import org.dcache.util.NettyPortRange;
+@@ -192,6 +193,8 @@ public class XrootdDoor
+ 
+     private PoolMonitor _poolMonitor;
+ 
++    private Capacity.Provider _capacity;
++
+     private final PermissionHandler _pdp = new ChainedPermissionHandler(
+           new ACLPermissionHandler(),
+           new PosixPermissionHandler());
+@@ -282,6 +285,10 @@ public class XrootdDoor
+         this.pinManagerStub = pinManagerStub;
+     }
+ 
++    public void setCapacity(Capacity.Provider capacity) {
++        _capacity = capacity;
++    }
++
+     @Required
+     public void setPnfsStub(CellStub pnfsStub) {
+         _pnfsStub = pnfsStub;
+@@ -1167,6 +1174,17 @@ public class XrootdDoor
+         return attributes.getChecksums();
+     }
+ 
++    /**
++     * Returns the capacity reported for the given path, which must exist and be accessible.
++     */
++    public Capacity getCapacity(FsPath fullPath, Subject subject, Restriction restriction)
++          throws CacheException {
++        boolean tag = _capacity.usesWriteToken();
++        FileAttributes attributes = new PnfsHandler(_pnfs, subject, restriction)
++              .getFileAttributes(fullPath.toString(), EnumSet.of(tag ? STORAGEINFO : TYPE));
++        return _capacity.get(tag ? attributes.getStorageInfo().getMap().get("writeToken") : null);
++    }
++
+     public FileStatus getFileStatus(FsPath fullPath, Subject subject,
+           Restriction restriction, String clientHost) throws CacheException {
+         /* Fetch file attributes.
+diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
+index 93aa401..da8b129 100644
+--- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
++++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
+@@ -29,6 +29,7 @@ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_InvalidRequest;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_ItExists;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_Qcksum;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_Qconfig;
++import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_Qspace;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_ServerError;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_async;
+ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_compress;
+@@ -101,6 +102,7 @@ import org.dcache.auth.attributes.Restrictions;
+ import org.dcache.auth.attributes.RootDirectory;
+ import org.dcache.cells.AbstractMessageCallback;
+ import org.dcache.namespace.FileAttribute;
++import org.dcache.space.Capacity;
+ import org.dcache.util.Checksum;
+ import org.dcache.util.list.DirectoryEntry;
+ import org.dcache.vehicles.PnfsListDirectoryMessage;
+@@ -1096,11 +1098,41 @@ public class XrootdRedirectHandler extends ConcurrentXrootdRequestHandler {
+                 } catch (CacheException e) {
+                     throw xrootdException(e);
+                 }
++
++            case kXR_Qspace:
++                try {
++                    // xrootd4j splits path and opaque data only for checksum and xattr queries
++                    String[] args = msg.getArgs().split("\\?", 2);
++                    LoginSessionInfo loginSessionInfo = sessionInfo();
++                    Capacity capacity = _door.getCapacity(createFullPath(args[0],
++                                safelyExtractOpaque(args.length > 1 ? args[1] : "")),
++                          loginSessionInfo.getSubject(),
++                          loginSessionInfo.getRestriction());
++                    return new QueryResponse(msg, toSpaceInfo(capacity));
++                } catch (CacheException e) {
++                    throw xrootdException(e);
++                }
++
+             default:
+                 return unsupported(ctx, msg);
+         }
+     }
+ 
++    /**
++     * Formats the capacity like xrootd's oss plugin. The space group is the space token of a
++     * reservation, or "public", xrootd's default space name, otherwise.
++     */
++    static String toSpaceInfo(Capacity capacity) {
++        long total = capacity.getTotalSpace();
++        long free = capacity.getFreeSpace();
++        return "oss.cgroup=" + capacity.getReservation().orElse("public")
++              + "&oss.space=" + total
++              + "&oss.free=" + free
++              + "&oss.maxf=" + free
++              + "&oss.used=" + capacity.getUsedSpace()
++              + "&oss.quota=" + total;
++    }
++
+     @Override
+     protected XrootdResponse<DirListRequest> doOnDirList(ChannelHandlerContext ctx,
+           DirListRequest request)
+diff --git a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
+index a91b1da..80dd753 100644
+--- a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
++++ b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
+@@ -193,6 +193,25 @@
+       </bean>
+     </property>
+     <property name="billingStub" ref="billing-stub"/>
++    <property name="capacity">
++      <bean class="org.dcache.space.Capacity$Provider">
++        <constructor-arg value="${xrootd.capacity.source}"/>
++        <constructor-arg value="${xrootd.capacity.reservation}"/>
++        <constructor-arg ref="pool-monitor"/>
++        <constructor-arg>
++          <bean class="org.dcache.space.ReservationCaches" factory-method="buildSpaceLookupCache">
++            <constructor-arg>
++              <bean class="org.dcache.cells.CellStub">
++                <property name="destination" value="${xrootd.service.spacemanager}"/>
++                <property name="timeout" value="${xrootd.service.spacemanager.timeout}"/>
++                <property name="timeoutUnit" value="${xrootd.service.spacemanager.timeout.unit}"/>
++              </bean>
++            </constructor-arg>
++            <constructor-arg ref="scheduled-thread-pool"/>
++          </bean>
++        </constructor-arg>
++      </bean>
++    </property>
+     <property name="writePaths" value="${xrootd.authz.write-paths}"/>
+     <property name="readPaths" value="${xrootd.authz.read-paths}"/>
+     <property name="pnfsHandler" ref="pnfs"/>
+diff --git a/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
+new file mode 100644
+index 0000000..7f434c5
+--- /dev/null
++++ b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
+@@ -0,0 +1,55 @@
++package org.dcache.xrootd.door;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++import com.google.common.util.concurrent.Futures;
++import diskCacheV111.util.FsPath;
++import diskCacheV111.util.PnfsHandler;
++import diskCacheV111.vehicles.GenericStorageInfo;
++import org.dcache.auth.Subjects;
++import org.dcache.auth.attributes.Restrictions;
++import org.dcache.cells.CellStub;
++import org.dcache.space.Capacity;
++import org.dcache.vehicles.FileAttributes;
++import org.dcache.vehicles.PnfsGetFileAttributes;
++import org.junit.Test;
++
++public class XrootdDoorSpaceQueryTest {
++
++    @Test
++    public void shouldPassWriteTokenOfQueriedPath() throws Exception {
++        CellStub pnfs = mock(CellStub.class);
++        when(pnfs.send(any(PnfsGetFileAttributes.class), anyLong())).thenAnswer(invocation -> {
++            PnfsGetFileAttributes request = invocation.getArgument(0);
++            GenericStorageInfo storageInfo = new GenericStorageInfo();
++            storageInfo.setKey("writeToken", "42");
++            FileAttributes attributes = new FileAttributes();
++            attributes.setStorageInfo(storageInfo);
++            request.setFileAttributes(attributes);
++            return Futures.immediateFuture(request);
++        });
++        Capacity.Provider provider = mock(Capacity.Provider.class);
++        when(provider.usesWriteToken()).thenReturn(true);
++        XrootdDoor door = new XrootdDoor();
++        door.setPnfsHandler(new PnfsHandler(pnfs));
++        door.setCapacity(provider);
++
++        door.getCapacity(FsPath.create("/data/cms"), Subjects.ROOT, Restrictions.none());
++
++        verify(provider).get("42");
++    }
++
++    @Test
++    public void shouldFormatSpaceInfoLikeXrootdOss() {
++        long size = 1L << 60;
++        assertThat(XrootdRedirectHandler.toSpaceInfo(Capacity.UNKNOWN),
++              is("oss.cgroup=public&oss.space=" + size + "&oss.free=" + size
++                    + "&oss.maxf=" + size + "&oss.used=0&oss.quota=" + size));
++    }
++}
+diff --git a/modules/dcache/src/main/java/org/dcache/space/Capacity.java b/modules/dcache/src/main/java/org/dcache/space/Capacity.java
+new file mode 100644
+index 0000000..ab2bb02
+--- /dev/null
++++ b/modules/dcache/src/main/java/org/dcache/space/Capacity.java
+@@ -0,0 +1,184 @@
++/*
++ * dCache - http://www.dcache.org/
++ *
++ * Copyright (C) 2026 Deutsches Elektronen-Synchrotron
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as
++ * published by the Free Software Foundation, either version 3 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++package org.dcache.space;
++
++import com.google.common.cache.LoadingCache;
++import diskCacheV111.pools.PoolCostInfo;
++import diskCacheV111.pools.PoolCostInfo.PoolSpaceInfo;
++import diskCacheV111.services.space.Space;
++import diskCacheV111.util.CacheException;
++import java.util.List;
++import java.util.Locale;
++import java.util.Optional;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutionException;
++import java.util.stream.Collectors;
++import org.dcache.poolmanager.PoolMonitor;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.remoting.RemoteAccessException;
++
++/**
++ * Total and free space reported by doors to clients (e.g., to df on an NFS or xrootdfs mount),
++ * as configured by the {@code <door>.capacity.source} and {@code <door>.capacity.reservation}
++ * properties.
++ */
++public final class Capacity {
++
++    private static final Logger LOGGER = LoggerFactory.getLogger(Capacity.class);
++
++    /**
++     * Reported if the capacity is unknown: the same fixed size that Chimera reports, all free.
++     */
++    public static final Capacity UNKNOWN = new Capacity(1L << 60, 1L << 60, null);
++
++    public enum Source {NAMESPACE, POOLS, RESERVATION}
++
++    private final long total;
++    private final long free;
++    private final String reservation;
++
++    private Capacity(long total, long free, String reservation) {
++        this.total = total;
++        this.free = Math.min(Math.max(0L, free), total);
++        this.reservation = reservation;
++    }
++
++    public long getTotalSpace() {
++        return total;
++    }
++
++    public long getFreeSpace() {
++        return free;
++    }
++
++    public long getUsedSpace() {
++        return total - free;
++    }
++
++    /**
++     * Returns the token of the space reservation this capacity was taken from, if any.
++     */
++    public Optional<String> getReservation() {
++        return Optional.ofNullable(reservation);
++    }
++
++    /**
++     * Determines the capacity a door reports.
++     */
++    public static class Provider {
++
++        private final Source source;
++        private final String reservation;
++        private final PoolMonitor poolMonitor;
++        private final LoadingCache<String, Optional<Space>> spaceLookupCache;
++        private final Set<String> failing = ConcurrentHashMap.newKeySet();
++
++        public Provider(String source, String reservation, PoolMonitor poolMonitor,
++              LoadingCache<String, Optional<Space>> spaceLookupCache) {
++            try {
++                this.source = Source.valueOf(source.strip().toUpperCase(Locale.ROOT));
++            } catch (IllegalArgumentException e) {
++                throw new IllegalArgumentException("Invalid capacity source: " + source);
++            }
++            this.reservation = reservation.isBlank() ? null : reservation.strip();
++            if (this.reservation != null && !this.reservation.matches("\\d+")) {
++                throw new IllegalArgumentException("Invalid space reservation: " + reservation);
++            }
++            this.poolMonitor = poolMonitor;
++            this.spaceLookupCache = spaceLookupCache;
++        }
++
++        public Source getSource() {
++            return source;
++        }
++
++        /**
++         * Whether the space reservation is given by the WriteToken tag of the queried path.
++         */
++        public boolean usesWriteToken() {
++            return source == Source.RESERVATION && reservation == null;
++        }
++
++        /**
++         * Returns the capacity to report. A failure is logged once, rather than for every query,
++         * until the capacity can be determined again.
++         *
++         * @param writeToken the WriteToken tag of the queried path, if {@link #usesWriteToken()}
++         */
++        public Capacity get(String writeToken) throws CacheException {
++            if (source == Source.NAMESPACE) {
++                return UNKNOWN;
++            }
++            String token = reservation != null ? reservation : writeToken;
++            if (source == Source.RESERVATION && token == null) {
++                throw new CacheException(CacheException.INVALID_ARGS,
++                      "Path is not under space management");
++            }
++            String what = source == Source.POOLS ? "pools" : "space reservation " + token;
++            try {
++                Capacity capacity = source == Source.POOLS ? ofPools() : ofReservation(token);
++                if (failing.remove(what)) {
++                    LOGGER.info("Capacity of {} can be determined again.", what);
++                }
++                return capacity;
++            } catch (CacheException e) {
++                if (failing.add(what)) {
++                    LOGGER.warn("{}; capacity queries fail until it can be determined.",
++                          e.getMessage());
++                }
++                throw e;
++            }
++        }
++
++        private Capacity ofReservation(String token) throws CacheException {
++            try {
++                Space space = spaceLookupCache.get(token).orElseThrow(
++                      () -> new CacheException("Space reservation " + token + " not found"));
++                return new Capacity(space.getSizeInBytes(), space.getAvailableSpaceInBytes(),
++                      token);
++            } catch (ExecutionException e) {
++                throw new CacheException("Failed to look up space reservation " + token + ": "
++                      + e.getCause().getMessage(), e.getCause());
++            }
++        }
++
++        /**
++         * Sums the space of all online pools, counting removable (cached) replicas as free, as
++         * the frontend does for storage resource reporting.
++         */
++        private Capacity ofPools() throws CacheException {
++            List<PoolSpaceInfo> pools;
++            try {
++                pools = poolMonitor.getCostModule().getPoolCostInfos().stream()
++                      .map(PoolCostInfo::getSpaceInfo).collect(Collectors.toList());
++            } catch (RemoteAccessException e) {
++                pools = List.of();
++            }
++            if (pools.isEmpty()) {
++                throw new CacheException(CacheException.SERVICE_UNAVAILABLE,
++                      "Pool information is not available");
++            }
++            return new Capacity(pools.stream().mapToLong(PoolSpaceInfo::getTotalSpace).sum(),
++                  pools.stream().mapToLong(p -> p.getFreeSpace() + p.getRemovableSpace()).sum(),
++                  null);
++        }
++    }
++}
+diff --git a/modules/dcache/src/test/java/org/dcache/space/CapacityTest.java b/modules/dcache/src/test/java/org/dcache/space/CapacityTest.java
+new file mode 100644
+index 0000000..c3ace45
+--- /dev/null
++++ b/modules/dcache/src/test/java/org/dcache/space/CapacityTest.java
+@@ -0,0 +1,122 @@
++package org.dcache.space;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.assertThrows;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import com.google.common.cache.CacheBuilder;
++import com.google.common.cache.CacheLoader;
++import diskCacheV111.poolManager.CostModule;
++import diskCacheV111.pools.PoolCostInfo;
++import diskCacheV111.services.space.Space;
++import diskCacheV111.services.space.SpaceState;
++import diskCacheV111.util.AccessLatency;
++import diskCacheV111.util.CacheException;
++import diskCacheV111.util.RetentionPolicy;
++import java.util.List;
++import java.util.Optional;
++import org.dcache.poolmanager.PoolMonitor;
++import org.junit.Test;
++
++public class CapacityTest {
++
++    private final PoolMonitor poolMonitor = mock(PoolMonitor.class);
++    private Optional<Space> space = Optional.of(space(42, 1000, 300, 200));
++
++    @Test
++    public void shouldReportFixedSizeForNamespace() throws Exception {
++        Capacity capacity = provider("namespace", "").get(null);
++
++        assertThat(capacity.getTotalSpace(), is(1L << 60));
++        assertThat(capacity.getUsedSpace(), is(0L));
++    }
++
++    @Test
++    public void shouldSumSpaceOfAllPools() throws Exception {
++        givenPools(pool("pool1", 1000, 100, 50), pool("pool2", 2000, 300, 0));
++
++        Capacity capacity = provider("pools", "").get(null);
++
++        assertThat(capacity.getTotalSpace(), is(3000L));
++        assertThat(capacity.getFreeSpace(), is(450L));
++    }
++
++    @Test
++    public void shouldFailWithoutPools() {
++        givenPools();
++
++        CacheException e = assertThrows(CacheException.class,
++              () -> provider("pools", "").get(null));
++        assertThat(e.getRc(), is(CacheException.SERVICE_UNAVAILABLE));
++    }
++
++    @Test
++    public void shouldReportConfiguredReservation() throws Exception {
++        Capacity.Provider provider = provider("reservation", "42");
++
++        Capacity capacity = provider.get("7");
++
++        assertThat(provider.usesWriteToken(), is(false));
++        assertThat(capacity.getTotalSpace(), is(1000L));
++        assertThat(capacity.getFreeSpace(), is(500L));
++        assertThat(capacity.getReservation(), is(Optional.of("42")));
++    }
++
++    @Test
++    public void shouldReportReservationOfWriteToken() throws Exception {
++        Capacity.Provider provider = provider("reservation", "");
++
++        assertThat(provider.usesWriteToken(), is(true));
++        assertThat(provider.get("42").getReservation(), is(Optional.of("42")));
++    }
++
++    @Test
++    public void shouldFailWithoutWriteToken() {
++        CacheException e = assertThrows(CacheException.class,
++              () -> provider("reservation", "").get(null));
++        assertThat(e.getRc(), is(CacheException.INVALID_ARGS));
++    }
++
++    @Test
++    public void shouldRecoverWhenReservationReappears() throws Exception {
++        Capacity.Provider provider = provider("reservation", "42");
++        space = Optional.empty();
++        assertThrows(CacheException.class, () -> provider.get(null));
++        assertThrows(CacheException.class, () -> provider.get(null));
++
++        space = Optional.of(space(42, 100, 80, 50));
++
++        assertThat(provider.get(null).getFreeSpace(), is(0L));
++    }
++
++    @Test
++    public void shouldRejectInvalidConfiguration() {
++        assertThrows(IllegalArgumentException.class, () -> provider("1234", ""));
++        assertThrows(IllegalArgumentException.class, () -> provider("reservation", "CMS_DISK"));
++    }
++
++    private Capacity.Provider provider(String source, String reservation) {
++        // Not cached, so that tests can change the space reservation.
++        return new Capacity.Provider(source, reservation, poolMonitor,
++              CacheBuilder.newBuilder().maximumSize(0).build(CacheLoader.from(token -> space)));
++    }
++
++    private void givenPools(PoolCostInfo... pools) {
++        CostModule costModule = mock(CostModule.class);
++        when(costModule.getPoolCostInfos()).thenReturn(List.of(pools));
++        when(poolMonitor.getCostModule()).thenReturn(costModule);
++    }
++
++    private static PoolCostInfo pool(String name, long total, long free, long removable) {
++        PoolCostInfo info = new PoolCostInfo(name, "regular");
++        info.setSpaceUsage(total, free, 0, removable);
++        return info;
++    }
++
++    static Space space(long id, long size, long used, long allocated) {
++        return new Space(id, null, null, RetentionPolicy.REPLICA, AccessLatency.ONLINE, 1, size,
++              0, null, "test", SpaceState.RESERVED, used, allocated);
++    }
++}
+diff --git a/skel/share/defaults/dcache.properties b/skel/share/defaults/dcache.properties
+index 44fa2b2..04cf1e6 100644
+--- a/skel/share/defaults/dcache.properties
++++ b/skel/share/defaults/dcache.properties
+@@ -1012,6 +1012,17 @@ dcache.authn.ciphers = DISABLE_RFC_7540_BANNED_CIPHERS, ENABLE_WEAK_CIPHERS_FOR_
+ #
+ (one-of?true|false)dcache.enable.space-reservation=true
+ 
++#  ---- Capacity reported to clients (e.g., by df on NFS or xrootdfs mounts)
++#
++#   namespace:   a fixed size of 1 EiB
++#   pools:       total and free (incl. removable) space of all online pools
++#   reservation: size and available space of a space reservation, given by
++#                dcache.capacity.reservation or, if empty, by the WriteToken
++#                tag of the queried path (not supported by NFS)
++#
++(one-of?namespace|pools|reservation)dcache.capacity.source = namespace
++dcache.capacity.reservation =
++
+ #  ---- Upload directory
+ #
+ #   Some protocols (currently just SRM) allow a client to upload a file and, once
+diff --git a/skel/share/defaults/nfs.properties b/skel/share/defaults/nfs.properties
+index d087ec4..66372b2 100644
+--- a/skel/share/defaults/nfs.properties
++++ b/skel/share/defaults/nfs.properties
+@@ -230,6 +230,14 @@ nfs.namespace-cache.size = 0
+ nfs.fs-stat-cache.time = 3600
+ (one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)nfs.fs-stat-cache.time.unit = SECONDS
+ 
++# Capacity reported as file system size, see dcache.capacity.source. File
++# counts and, with 'namespace', used space are taken from the namespace.
++(one-of?namespace|pools|reservation|${dcache.capacity.source})nfs.capacity.source = ${dcache.capacity.source}
++nfs.capacity.reservation = ${dcache.capacity.reservation}
++nfs.service.spacemanager = ${dcache.service.spacemanager}
++nfs.service.spacemanager.timeout = 30000
++(one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)nfs.service.spacemanager.timeout.unit = MILLISECONDS
++
+ 
+ #
+ # Directory listing cache size. NOTICE, that this is the number of directories to cache,
+diff --git a/skel/share/defaults/xrootd.properties b/skel/share/defaults/xrootd.properties
+index 0d97a26..b41a619 100644
+--- a/skel/share/defaults/xrootd.properties
++++ b/skel/share/defaults/xrootd.properties
+@@ -55,6 +55,14 @@ xrootd.limits.login-cache.size=500
+ # Whether space reservations are supported
+ (one-of?true|false|${dcache.enable.space-reservation})xrootd.enable.space-reservation=${dcache.enable.space-reservation}
+ 
++# Capacity reported in reply to space queries (kXR_Qspace), see
++# dcache.capacity.source.
++(one-of?namespace|pools|reservation|${dcache.capacity.source})xrootd.capacity.source = ${dcache.capacity.source}
++xrootd.capacity.reservation = ${dcache.capacity.reservation}
++xrootd.service.spacemanager = ${dcache.service.spacemanager}
++xrootd.service.spacemanager.timeout = 30000
++(one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)xrootd.service.spacemanager.timeout.unit = MILLISECONDS
++
+ # ---- Whether to expect the haproxy Proxy Protocol
+ #
+ # Many load balancers and reverse proxies support the Proxy Protocol, a
+-- 
+2.47.3
+

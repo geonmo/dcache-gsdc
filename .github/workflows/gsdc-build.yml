@@ -90,6 +90,12 @@ jobs:
     env:
       VERSION: ${{ needs.detect.outputs.version }}
       BUILD_ID: ${{ needs.detect.outputs.build_id }}
+      # download.dcache.org repeatedly timed out on connect from GitHub runners;
+      # wait longer and retry (resolver for maven >= 3.9, wagon for older).
+      MAVEN_OPTS: >-
+        -Daether.connector.connectTimeout=60000
+        -Daether.connector.http.retryHandler.count=5
+        -Dmaven.wagon.http.retryHandler.count=5
     steps:
       - name: Check out site files
         uses: actions/checkout@v4
