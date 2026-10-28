@@ -1,4 +1,4 @@
-From 16e9d534b2a91773eae0546338d80027a17769b1 Mon Sep 17 00:00:00 2001
+From 66a6d59c47f9754ae371da2388b3ed83b86115fa Mon Sep 17 00:00:00 2001
 From: Geonmo Ryu <geonmo@kisti.re.kr>
 Date: Wed, 28 Oct 2026 10:18:14 +0900
 Subject: [PATCH 3/3] xrootd: answer space queries with the configured capacity
@@ -26,6 +26,10 @@ The queried path must exist and be accessible by the user. Space
 reservations are looked up through the existing ReservationCaches space
 lookup cache, for which a space manager cell stub is added to the door.
 
+If a space reservation can't be looked up, the query fails, and the
+door logs a warning once (not for every query) until the reservation
+can be looked up again.
+
 Result:
 xrootd clients see a capacity for dCache, consistent with the NFS door:
 by default, `xrdfs spaceinfo` succeeds and `df` on an xrootdfs mount
@@ -40,12 +44,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Q2bGtq8WdR49xdKuc2BaVc
 ---
  .../src/main/markdown/config-xrootd.md        |  33 +++
- .../org/dcache/xrootd/door/XrootdDoor.java    |  68 ++++++
+ .../org/dcache/xrootd/door/XrootdDoor.java    |  89 +++++++
  .../xrootd/door/XrootdRedirectHandler.java    |  46 ++++
  .../org/dcache/xrootd/door/xrootd.xml         |  15 ++
- .../xrootd/door/XrootdDoorSpaceQueryTest.java | 210 ++++++++++++++++++
+ .../xrootd/door/XrootdDoorSpaceQueryTest.java | 231 ++++++++++++++++++
  skel/share/defaults/xrootd.properties         |  23 ++
- 6 files changed, 395 insertions(+)
+ 6 files changed, 437 insertions(+)
  create mode 100644 modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
 
 diff --git a/docs/TheBook/src/main/markdown/config-xrootd.md b/docs/TheBook/src/main/markdown/config-xrootd.md
@@ -93,7 +97,7 @@ index 6b3c652..321eecb 100644
  
  The `xrootd-door` has several other configuration properties. You can
 diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
-index 00e3890..866a3c9 100644
+index 00e3890..97a9a84 100644
 --- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
 +++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
 @@ -39,8 +39,10 @@ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_xset;
@@ -123,18 +127,19 @@ index 00e3890..866a3c9 100644
  import org.dcache.util.Checksum;
  import org.dcache.util.FireAndForgetTask;
  import org.dcache.util.NettyPortRange;
-@@ -190,6 +194,10 @@ public class XrootdDoor
+@@ -190,6 +194,11 @@ public class XrootdDoor
      private CellStub pinManagerStub;
      private CellStub _billingStub;
  
 +    private Capacity.Source _capacitySource = Capacity.Source.NAMESPACE;
 +    private Optional<String> _capacityReservation = Optional.empty();
 +    private LoadingCache<String, Optional<Space>> _spaceLookupCache;
++    private final Set<String> _unavailableReservations = ConcurrentHashMap.newKeySet();
 +
      private PoolMonitor _poolMonitor;
  
      private final PermissionHandler _pdp = new ChainedPermissionHandler(
-@@ -282,6 +290,18 @@ public class XrootdDoor
+@@ -282,6 +291,18 @@ public class XrootdDoor
          this.pinManagerStub = pinManagerStub;
      }
  
@@ -153,7 +158,7 @@ index 00e3890..866a3c9 100644
      @Required
      public void setPnfsStub(CellStub pnfsStub) {
          _pnfsStub = pnfsStub;
-@@ -1167,6 +1187,54 @@ public class XrootdDoor
+@@ -1167,6 +1188,74 @@ public class XrootdDoor
          return attributes.getChecksums();
      }
  
@@ -192,9 +197,29 @@ index 00e3890..866a3c9 100644
 +        }
 +    }
 +
++    /**
++     * Logs a failure to look up a space reservation once, rather than for every query, until the
++     * reservation can be looked up again.
++     */
 +    private Capacity lookUpSpace(String token) throws CacheException {
 +        try {
-+            return _spaceLookupCache.get(token).map(Capacity::of).orElseThrow(
++            Capacity capacity = Capacity.of(fetchSpace(token));
++            if (_unavailableReservations.remove(token)) {
++                _log.info("Space reservation {} can be looked up again.", token);
++            }
++            return capacity;
++        } catch (CacheException e) {
++            if (_unavailableReservations.add(token)) {
++                _log.warn("{}; space queries for it fail until it can be looked up.",
++                      e.getMessage());
++            }
++            throw e;
++        }
++    }
++
++    private Space fetchSpace(String token) throws CacheException {
++        try {
++            return _spaceLookupCache.get(token).orElseThrow(
 +                  () -> new CacheException("Space reservation " + token + " not found"));
 +        } catch (ExecutionException e) {
 +            Throwable cause = e.getCause();
@@ -319,10 +344,10 @@ index a91b1da..47d12b7 100644
      <property name="pnfsHandler" ref="pnfs"/>
 diff --git a/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
 new file mode 100644
-index 0000000..e56b193
+index 0000000..d226bcc
 --- /dev/null
 +++ b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,231 @@
 +package org.dcache.xrootd.door;
 +
 +import static org.hamcrest.MatcherAssert.assertThat;
@@ -351,6 +376,7 @@ index 0000000..e56b193
 +import diskCacheV111.vehicles.GenericStorageInfo;
 +import java.util.Arrays;
 +import java.util.Optional;
++import java.util.concurrent.atomic.AtomicBoolean;
 +import javax.security.auth.Subject;
 +import org.dcache.auth.Subjects;
 +import org.dcache.auth.attributes.Restrictions;
@@ -463,6 +489,26 @@ index 0000000..e56b193
 +
 +        assertThrows(CacheException.class,
 +              () -> door.getCapacity(PATH, subject, Restrictions.none()));
++    }
++
++    @Test
++    public void shouldKeepFailingAndRecoverAfterReservationReappears() throws Exception {
++        givenWriteToken(null);
++        AtomicBoolean exists = new AtomicBoolean(false);
++        // No caching, so that the test sees the reservation appear.
++        door.setSpaceLookupCache(CacheBuilder.newBuilder().maximumSize(0).build(CacheLoader.from(
++              token -> exists.get() ? Optional.of(space(1000, 300, 200)) : Optional.empty())));
++        door.setCapacitySource("reservation");
++        door.setCapacityReservation("42");
++
++        assertThrows(CacheException.class,
++              () -> door.getCapacity(PATH, subject, Restrictions.none()));
++        assertThrows(CacheException.class,
++              () -> door.getCapacity(PATH, subject, Restrictions.none()));
++
++        exists.set(true);
++        assertThat(door.getCapacity(PATH, subject, Restrictions.none()).getTotalSpace(),
++              is(1000L));
 +    }
 +
 +    @Test
