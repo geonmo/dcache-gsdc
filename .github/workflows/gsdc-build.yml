@@ -2,8 +2,8 @@
 # Builds dCache with the GSDC site patches whenever a new official release of
 # the tracked series is published on Docker Hub:
 #
-#  - RPM, attached to a GitHub release named <version>-2_GSDC
-#  - container image ghcr.io/<owner>/dcache:<version>-2_GSDC, which is the
+#  - RPM, attached to a GitHub release named <version>-<N>_GSDC (N = 2, 3, ...)
+#  - container image ghcr.io/<owner>/dcache:<version>-<N>_GSDC, which is the
 #    official dcache/dcache:<version> image with the patched files on top
 #
 # The GitHub release doubles as the "already built" marker.
@@ -20,13 +20,15 @@ on:
         required: false
         default: ''
       force:
-        description: 'Rebuild even if the release already exists'
+        description: 'Build the next site release (e.g. -3_GSDC after -2_GSDC) even if one exists'
         type: boolean
         default: false
 
 env:
   SERIES: '11.2'
-  BUILD_ID: '2'
+  # Release number of the first site build of a version. Official RPMs are
+  # always -1, so site builds start at -2 and count up from there.
+  FIRST_BUILD_ID: '2'
   LOCAL_VERSION: '_GSDC'
   UPSTREAM: 'https://github.com/dCache/dcache.git'
   IMAGE: ghcr.io/${{ github.repository }}
@@ -37,6 +39,7 @@ jobs:
     outputs:
       version: ${{ steps.detect.outputs.version }}
       latest: ${{ steps.detect.outputs.latest }}
+      build_id: ${{ steps.detect.outputs.build_id }}
     steps:
       - id: detect
         env:
@@ -59,13 +62,20 @@ jobs:
             exit 1
           fi
 
-          release="${version}-${BUILD_ID}${LOCAL_VERSION}"
-          if gh release view "$release" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && [[ "$FORCE" != true ]]; then
-            echo "Release $release already exists; nothing to do."
+          last=$(gh release list -R "$GITHUB_REPOSITORY" --limit 1000 --json tagName -q '.[].tagName' \
+                   | sed -n "s/^${version//./\\.}-\([0-9][0-9]*\)${LOCAL_VERSION}\$/\1/p" \
+                   | sort -n | tail -n 1)
+          if [[ -z "$last" ]]; then
+            build_id=$FIRST_BUILD_ID
+          elif [[ "$FORCE" == true ]]; then
+            build_id=$((last + 1))
+          else
+            echo "Release ${version}-${last}${LOCAL_VERSION} already exists; nothing to do."
             version=
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build_id=$build_id" >> "$GITHUB_OUTPUT"
           echo "latest=$([[ "$version" == "$newest" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   build:
@@ -79,6 +89,7 @@ jobs:
       patched: ${{ steps.patch.outcome == 'success' }}
     env:
       VERSION: ${{ needs.detect.outputs.version }}
+      BUILD_ID: ${{ needs.detect.outputs.build_id }}
     steps:
       - name: Check out site files
         uses: actions/checkout@v4
@@ -137,6 +148,7 @@ jobs:
       issues: write
     env:
       VERSION: ${{ needs.detect.outputs.version }}
+      BUILD_ID: ${{ needs.detect.outputs.build_id }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - run: |
@@ -152,6 +164,7 @@ jobs:
       packages: write
     env:
       VERSION: ${{ needs.detect.outputs.version }}
+      BUILD_ID: ${{ needs.detect.outputs.build_id }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out site files

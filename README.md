@@ -16,10 +16,14 @@ on top of official dCache releases, and the workflow that builds them:
 When a new `11.2.x` image appears on Docker Hub (checked daily, or started by hand
 from the *Actions* tab), the workflow builds:
 
-- the RPM `dcache-<version>-2_GSDC.noarch.rpm`, attached to the GitHub release
-  `<version>-2_GSDC`
-- the image `ghcr.io/geonmo/dcache-gsdc:<version>-2_GSDC`, and the moving tag
+- the RPM `dcache-<version>-<N>_GSDC.noarch.rpm`, attached to the GitHub release
+  `<version>-<N>_GSDC`
+- the image `ghcr.io/geonmo/dcache-gsdc:<version>-<N>_GSDC`, and the moving tag
   `ghcr.io/geonmo/dcache-gsdc:11.2-gsdc` for the newest release
+
+`<N>` starts at 2, as official RPMs are always `-1`. Running the workflow by
+hand with *force* builds the next number (e.g. `-3_GSDC` after `-2_GSDC`), so
+earlier site builds stay available.
 
 An official release with a higher version (e.g. `11.2.11-1`) replaces the site
 build when installed. If the patches no longer apply to a new release, the
