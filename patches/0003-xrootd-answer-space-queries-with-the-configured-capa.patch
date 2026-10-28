@@ -1,61 +1,82 @@
-From bfbacb2eccd62ec0367be0ca2241ad6ddc6e506d Mon Sep 17 00:00:00 2001
+From 16e9d534b2a91773eae0546338d80027a17769b1 Mon Sep 17 00:00:00 2001
 From: Geonmo Ryu <geonmo@kisti.re.kr>
-Date: Tue, 27 Oct 2026 17:56:08 +0900
-Subject: [PATCH 2/2] xrootd: answer space queries based on the WriteToken tag
+Date: Wed, 28 Oct 2026 10:18:14 +0900
+Subject: [PATCH 3/3] xrootd: answer space queries with the configured capacity
 
 Motivation:
 The xrootd door doesn't support kXR_Qspace queries. As a result,
 `xrdfs spaceinfo` fails and `df` on a directory mounted with xrootdfs
-shows a size of zero (and plain `df` hides the mount).
+shows a size of zero, so plain `df` hides the mount, while the NFS door
+reports a size of 1 EiB for the same instance.
 
 Modification:
-Handle kXR_Qspace in XrootdRedirectHandler if space reservation is
-enabled. The door looks up the space reservation of the queried path
-through its WriteToken directory tag, as the FTP door does for SITE
-USAGE, and replies with the reservation size and the space still
-available in it, using the format of xrootd's oss plugin
-(oss.space, oss.free, oss.used, oss.maxf, ...).
+Handle kXR_Qspace in XrootdRedirectHandler, reporting the capacity
+selected by the new xrootd.capacity.source and
+xrootd.capacity.reservation properties (defaulting to
+dcache.capacity.source and dcache.capacity.reservation) in the format of
+xrootd's oss plugin:
 
-The space reservation is looked up through the existing
-ReservationCaches space lookup cache, for which a space manager cell
-stub is added to the door.
+- namespace (default): a fixed size of 1 EiB, all of which is free
+- pools: the total and free space summed over all online pools
+- reservation: the configured space reservation or, if none is
+  configured, the one given by the WriteToken directory tag of the
+  queried path, as the FTP door does for SITE USAGE
+
+The queried path must exist and be accessible by the user. Space
+reservations are looked up through the existing ReservationCaches space
+lookup cache, for which a space manager cell stub is added to the door.
 
 Result:
-Clients can query the capacity of a space reservation through the
-xrootd door, e.g., with `xrdfs spaceinfo` or `df` on an xrootdfs mount.
+xrootd clients see a capacity for dCache, consistent with the NFS door:
+by default, `xrdfs spaceinfo` succeeds and `df` on an xrootdfs mount
+shows 1 EiB instead of hiding the mount. Sites can report the capacity
+of the pools or of a space reservation instead.
 
 Target: master
 Require-book: yes
 Require-notes: yes
 Signed-off-by: Geonmo Ryu <geonmo@kisti.re.kr>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01X3vgU3NxbVFvgV6UtwTwvP
+Claude-Session: https://claude.ai/code/session_01Q2bGtq8WdR49xdKuc2BaVc
 ---
- .../src/main/markdown/config-xrootd.md        |  21 +++
- .../org/dcache/xrootd/door/XrootdDoor.java    |  45 ++++++
- .../xrootd/door/XrootdRedirectHandler.java    |  45 ++++++
- .../org/dcache/xrootd/door/xrootd.xml         |  14 ++
- .../xrootd/door/XrootdDoorSpaceQueryTest.java | 138 ++++++++++++++++++
- skel/share/defaults/xrootd.properties         |   9 ++
- 6 files changed, 272 insertions(+)
+ .../src/main/markdown/config-xrootd.md        |  33 +++
+ .../org/dcache/xrootd/door/XrootdDoor.java    |  68 ++++++
+ .../xrootd/door/XrootdRedirectHandler.java    |  46 ++++
+ .../org/dcache/xrootd/door/xrootd.xml         |  15 ++
+ .../xrootd/door/XrootdDoorSpaceQueryTest.java | 210 ++++++++++++++++++
+ skel/share/defaults/xrootd.properties         |  23 ++
+ 6 files changed, 395 insertions(+)
  create mode 100644 modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
 
 diff --git a/docs/TheBook/src/main/markdown/config-xrootd.md b/docs/TheBook/src/main/markdown/config-xrootd.md
-index 6b3c652590..f0e6d008d2 100644
+index 6b3c652..321eecb 100644
 --- a/docs/TheBook/src/main/markdown/config-xrootd.md
 +++ b/docs/TheBook/src/main/markdown/config-xrootd.md
-@@ -685,6 +685,27 @@ xrootd.net.proxy.response-timeout-in-secs=30
+@@ -685,6 +685,39 @@ xrootd.net.proxy.response-timeout-in-secs=30
  dcache.java.memory.direct=16384m
  ```
  
 +### Space usage queries
 +
-+If space reservation is enabled (`xrootd.enable.space-reservation`), the
-+door answers space queries (`kXR_Qspace`) for paths that are associated
-+with a space reservation through the `WriteToken` directory tag. The
-+reply reports the size of the reservation and the space still available
-+in it, using the same format as xrootd's oss plugin. This allows
-+clients to see the capacity of a space reservation, e.g.:
++The door answers space queries (`kXR_Qspace`), e.g. from `xrdfs spaceinfo`
++or `df` on a directory mounted with `xrootdfs`, in the same format as
++xrootd's oss plugin. The reported capacity is selected by
++`xrootd.capacity.source`, which defaults to `dcache.capacity.source`:
++
++| Value | Reported size | Reported free space |
++|---|---|---|
++| `namespace` (default) | 1 EiB | 1 EiB |
++| `pools` | Sum of the total space of all online pools | Sum of the free and removable space of those pools |
++| `reservation` | Size of the space reservation | Space neither used nor allocated in the reservation |
++
++With `reservation`, the space reservation is given by
++`xrootd.capacity.reservation` or, if that is empty, by the `WriteToken`
++directory tag of the queried path. For paths without a `WriteToken` tag
++the query then fails. For example:
++
++```ini
++xrootd.capacity.source = reservation
++```
 +
 +```console-user
 +xrdfs door.example.org spaceinfo /data/cms
@@ -66,14 +87,13 @@ index 6b3c652590..f0e6d008d2 100644
 +|Largest free chunk: 274877906944
 +```
 +
-+and makes `df` show the same values on a directory mounted with
-+`xrootdfs`. For paths without a `WriteToken` tag the query fails.
++The queried path must exist and be accessible by the user.
 +
  ### Other configuration options
  
  The `xrootd-door` has several other configuration properties. You can
 diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
-index 00e3890005..6960ff8c9c 100644
+index 00e3890..866a3c9 100644
 --- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
 +++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdDoor.java
 @@ -39,8 +39,10 @@ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_xset;
@@ -95,26 +115,35 @@ index 00e3890005..6960ff8c9c 100644
  import java.util.concurrent.RejectedExecutionException;
  import java.util.concurrent.ScheduledExecutorService;
  import java.util.concurrent.ScheduledFuture;
-@@ -190,6 +193,9 @@ public class XrootdDoor
+@@ -116,6 +119,7 @@ import org.dcache.pinmanager.PinManagerPinMessage;
+ import org.dcache.pinmanager.PinManagerUnpinMessage;
+ import org.dcache.poolmanager.PoolManagerStub;
+ import org.dcache.poolmanager.PoolMonitor;
++import org.dcache.space.Capacity;
+ import org.dcache.util.Checksum;
+ import org.dcache.util.FireAndForgetTask;
+ import org.dcache.util.NettyPortRange;
+@@ -190,6 +194,10 @@ public class XrootdDoor
      private CellStub pinManagerStub;
      private CellStub _billingStub;
  
-+    private boolean _spaceReservationEnabled;
++    private Capacity.Source _capacitySource = Capacity.Source.NAMESPACE;
++    private Optional<String> _capacityReservation = Optional.empty();
 +    private LoadingCache<String, Optional<Space>> _spaceLookupCache;
 +
      private PoolMonitor _poolMonitor;
  
      private final PermissionHandler _pdp = new ChainedPermissionHandler(
-@@ -282,6 +288,18 @@ public class XrootdDoor
+@@ -282,6 +290,18 @@ public class XrootdDoor
          this.pinManagerStub = pinManagerStub;
      }
  
-+    public void setSpaceReservationEnabled(boolean enabled) {
-+        _spaceReservationEnabled = enabled;
++    public void setCapacitySource(String source) {
++        _capacitySource = Capacity.Source.fromProperty(source);
 +    }
 +
-+    public boolean isSpaceReservationEnabled() {
-+        return _spaceReservationEnabled;
++    public void setCapacityReservation(String reservation) {
++        _capacityReservation = Capacity.parseReservation(reservation);
 +    }
 +
 +    public void setSpaceLookupCache(LoadingCache<String, Optional<Space>> cache) {
@@ -124,27 +153,48 @@ index 00e3890005..6960ff8c9c 100644
      @Required
      public void setPnfsStub(CellStub pnfsStub) {
          _pnfsStub = pnfsStub;
-@@ -1167,6 +1185,33 @@ public class XrootdDoor
+@@ -1167,6 +1187,54 @@ public class XrootdDoor
          return attributes.getChecksums();
      }
  
 +    /**
-+     * Returns the space reservation that the given path is associated with through the
-+     * WriteToken directory tag.
++     * Returns the capacity reported for the given path, as configured by xrootd.capacity.source.
++     * The path must exist and be accessible by the user. With 'reservation' and no configured space
++     * token, the space reservation is the one the path is associated with through the WriteToken
++     * directory tag.
 +     */
-+    public Space getWriteTokenSpace(FsPath fullPath, Subject subject, Restriction restriction)
++    public Capacity getCapacity(FsPath fullPath, Subject subject, Restriction restriction)
 +          throws CacheException {
++        boolean useWriteToken = _capacitySource == Capacity.Source.RESERVATION
++              && _capacityReservation.isEmpty();
 +        PnfsHandler pnfsHandler = new PnfsHandler(_pnfs, subject, restriction);
 +        FileAttributes attributes = pnfsHandler.getFileAttributes(fullPath.toString(),
-+              EnumSet.of(STORAGEINFO));
-+        String token = attributes.getStorageInfo().getMap().get("writeToken");
-+        if (token == null) {
-+            throw new CacheException(CacheException.INVALID_ARGS,
-+                  fullPath + " is not under space management");
-+        }
++              useWriteToken ? EnumSet.of(STORAGEINFO) : EnumSet.of(TYPE));
 +
++        switch (_capacitySource) {
++            case NAMESPACE:
++                return Capacity.UNKNOWN;
++            case POOLS:
++                return Capacity.ofPools(_poolMonitor).orElseThrow(
++                      () -> new CacheException(CacheException.SERVICE_UNAVAILABLE,
++                            "Pool information is not available"));
++            case RESERVATION:
++                String token = useWriteToken
++                      ? attributes.getStorageInfo().getMap().get("writeToken")
++                      : _capacityReservation.get();
++                if (token == null) {
++                    throw new CacheException(CacheException.INVALID_ARGS,
++                          fullPath + " is not under space management");
++                }
++                return lookUpSpace(token);
++            default:
++                throw new IllegalStateException("Unexpected capacity source: " + _capacitySource);
++        }
++    }
++
++    private Capacity lookUpSpace(String token) throws CacheException {
 +        try {
-+            return _spaceLookupCache.get(token).orElseThrow(
++            return _spaceLookupCache.get(token).map(Capacity::of).orElseThrow(
 +                  () -> new CacheException("Space reservation " + token + " not found"));
 +        } catch (ExecutionException e) {
 +            Throwable cause = e.getCause();
@@ -159,7 +209,7 @@ index 00e3890005..6960ff8c9c 100644
            Restriction restriction, String clientHost) throws CacheException {
          /* Fetch file attributes.
 diff --git a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
-index 93aa40153d..fc04c27897 100644
+index 93aa401..e3415b5 100644
 --- a/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
 +++ b/modules/dcache-xrootd/src/main/java/org/dcache/xrootd/door/XrootdRedirectHandler.java
 @@ -29,6 +29,7 @@ import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_InvalidRequest;
@@ -170,23 +220,20 @@ index 93aa40153d..fc04c27897 100644
  import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_ServerError;
  import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_async;
  import static org.dcache.xrootd.protocol.XrootdProtocol.kXR_compress;
-@@ -61,6 +62,7 @@ import static org.dcache.xrootd.util.TriedRc.IOERR;
- import com.google.common.base.Strings;
- import com.google.common.base.Throwables;
- import com.google.common.net.InetAddresses;
-+import diskCacheV111.services.space.Space;
- import diskCacheV111.util.CacheException;
- import diskCacheV111.util.FileExistsCacheException;
- import diskCacheV111.util.FileIsNewCacheException;
-@@ -1096,11 +1098,54 @@ public class XrootdRedirectHandler extends ConcurrentXrootdRequestHandler {
+@@ -101,6 +102,7 @@ import org.dcache.auth.attributes.Restrictions;
+ import org.dcache.auth.attributes.RootDirectory;
+ import org.dcache.cells.AbstractMessageCallback;
+ import org.dcache.namespace.FileAttribute;
++import org.dcache.space.Capacity;
+ import org.dcache.util.Checksum;
+ import org.dcache.util.list.DirectoryEntry;
+ import org.dcache.vehicles.PnfsListDirectoryMessage;
+@@ -1096,11 +1098,55 @@ public class XrootdRedirectHandler extends ConcurrentXrootdRequestHandler {
                  } catch (CacheException e) {
                      throw xrootdException(e);
                  }
 +
 +            case kXR_Qspace:
-+                if (!_door.isSpaceReservationEnabled()) {
-+                    return unsupported(ctx, msg);
-+                }
 +                return querySpace(msg);
 +
              default:
@@ -195,8 +242,8 @@ index 93aa40153d..fc04c27897 100644
      }
  
 +    /**
-+     * Reports the space reservation of the queried path, as given by its WriteToken directory
-+     * tag, in the format used by xrootd's oss plugin.
++     * Reports the capacity of the queried path, as configured by xrootd.capacity.source, in the
++     * format used by xrootd's oss plugin.
 +     */
 +    private QueryResponse querySpace(QueryRequest msg) throws XrootdException {
 +        String args = msg.getArgs();
@@ -209,32 +256,36 @@ index 93aa40153d..fc04c27897 100644
 +
 +        try {
 +            LoginSessionInfo loginSessionInfo = sessionInfo();
-+            Space space = _door.getWriteTokenSpace(
++            Capacity capacity = _door.getCapacity(
 +                  createFullPath(path, safelyExtractOpaque(opaque)),
 +                  loginSessionInfo.getSubject(),
 +                  loginSessionInfo.getRestriction());
-+            return new QueryResponse(msg, toSpaceInfo(space));
++            return new QueryResponse(msg, toSpaceInfo(capacity));
 +        } catch (CacheException e) {
 +            throw xrootdException(e);
 +        }
 +    }
 +
-+    static String toSpaceInfo(Space space) {
-+        long size = space.getSizeInBytes();
-+        long free = Math.max(0L, space.getAvailableSpaceInBytes());
-+        return "oss.cgroup=" + space.getId()
-+              + "&oss.space=" + size
++    /**
++     * Formats the capacity like xrootd's oss plugin. The space group is the space token of a
++     * reservation, or "public", xrootd's default space name, otherwise.
++     */
++    static String toSpaceInfo(Capacity capacity) {
++        long total = capacity.getTotalSpace();
++        long free = capacity.getFreeSpace();
++        return "oss.cgroup=" + capacity.getReservation().orElse("public")
++              + "&oss.space=" + total
 +              + "&oss.free=" + free
 +              + "&oss.maxf=" + free
-+              + "&oss.used=" + (size - free)
-+              + "&oss.quota=" + size;
++              + "&oss.used=" + capacity.getUsedSpace()
++              + "&oss.quota=" + total;
 +    }
 +
      @Override
      protected XrootdResponse<DirListRequest> doOnDirList(ChannelHandlerContext ctx,
            DirListRequest request)
 diff --git a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
-index a91b1da235..adb447fe66 100644
+index a91b1da..47d12b7 100644
 --- a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
 +++ b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
 @@ -61,6 +61,13 @@
@@ -251,11 +302,12 @@ index a91b1da235..adb447fe66 100644
    <bean id="gPlazma-stub" class="org.dcache.cells.CellStub">
      <description>gPlazma communication stub</description>
      <property name="destination" value="${xrootd.service.gplazma}"/>
-@@ -193,6 +200,13 @@
+@@ -193,6 +200,14 @@
        </bean>
      </property>
      <property name="billingStub" ref="billing-stub"/>
-+    <property name="spaceReservationEnabled" value="${xrootd.enable.space-reservation}"/>
++    <property name="capacitySource" value="${xrootd.capacity.source}"/>
++    <property name="capacityReservation" value="${xrootd.capacity.reservation}"/>
 +    <property name="spaceLookupCache">
 +      <bean class="org.dcache.space.ReservationCaches" factory-method="buildSpaceLookupCache">
 +        <constructor-arg ref="space-manager-stub"/>
@@ -267,10 +319,10 @@ index a91b1da235..adb447fe66 100644
      <property name="pnfsHandler" ref="pnfs"/>
 diff --git a/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
 new file mode 100644
-index 0000000000..a32a439f50
+index 0000000..e56b193
 --- /dev/null
 +++ b/modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,210 @@
 +package org.dcache.xrootd.door;
 +
 +import static org.hamcrest.MatcherAssert.assertThat;
@@ -286,6 +338,8 @@ index 0000000000..a32a439f50
 +import com.google.common.cache.CacheBuilder;
 +import com.google.common.cache.CacheLoader;
 +import com.google.common.util.concurrent.Futures;
++import diskCacheV111.poolManager.CostModule;
++import diskCacheV111.pools.PoolCostInfo;
 +import diskCacheV111.services.space.Space;
 +import diskCacheV111.services.space.SpaceState;
 +import diskCacheV111.util.AccessLatency;
@@ -295,19 +349,22 @@ index 0000000000..a32a439f50
 +import diskCacheV111.util.RetentionPolicy;
 +import diskCacheV111.util.TimeoutCacheException;
 +import diskCacheV111.vehicles.GenericStorageInfo;
++import java.util.Arrays;
 +import java.util.Optional;
 +import javax.security.auth.Subject;
 +import org.dcache.auth.Subjects;
 +import org.dcache.auth.attributes.Restrictions;
 +import org.dcache.cells.CellStub;
++import org.dcache.poolmanager.PoolMonitor;
++import org.dcache.space.Capacity;
 +import org.dcache.vehicles.FileAttributes;
 +import org.dcache.vehicles.PnfsGetFileAttributes;
 +import org.junit.Before;
 +import org.junit.Test;
 +
 +/**
-+ * Unit tests for {@link XrootdDoor#getWriteTokenSpace} and
-+ * {@link XrootdRedirectHandler#toSpaceInfo}, which back kXR_Qspace queries.
++ * Unit tests for {@link XrootdDoor#getCapacity} and {@link XrootdRedirectHandler#toSpaceInfo},
++ * which back kXR_Qspace queries.
 + */
 +public class XrootdDoorSpaceQueryTest {
 +
@@ -323,28 +380,78 @@ index 0000000000..a32a439f50
 +
 +        door = new XrootdDoor();
 +        door.setPnfsHandler(new PnfsHandler(pnfsCellStub));
-+        door.setSpaceReservationEnabled(true);
 +
 +        subject = Subjects.of(1000, 1000, new int[]{1000});
 +    }
 +
 +    @Test
-+    public void shouldReturnSpaceOfWriteToken() throws Exception {
-+        Space space = space(1000, 300, 200);
-+        givenWriteToken("42");
-+        givenSpaceLookup(token -> token.equals("42") ? Optional.of(space) : Optional.empty());
++    public void shouldReportUnknownCapacityByDefault() throws Exception {
++        givenWriteToken(null);
 +
-+        assertThat(door.getWriteTokenSpace(PATH, subject, Restrictions.none()),
-+              is(sameInstance(space)));
++        Capacity capacity = door.getCapacity(PATH, subject, Restrictions.none());
++
++        assertThat(capacity.getTotalSpace(), is(1L << 60));
++        assertThat(capacity.getUsedSpace(), is(0L));
++    }
++
++    @Test
++    public void shouldReportSpaceOfAllPools() throws Exception {
++        givenWriteToken(null);
++        givenPools(pool("pool1", 1000, 100, 50), pool("pool2", 2000, 300, 0));
++        door.setCapacitySource("pools");
++
++        Capacity capacity = door.getCapacity(PATH, subject, Restrictions.none());
++
++        assertThat(capacity.getTotalSpace(), is(3000L));
++        assertThat(capacity.getFreeSpace(), is(450L));
++    }
++
++    @Test
++    public void shouldFailIfPoolInformationIsNotAvailable() {
++        givenWriteToken(null);
++        givenPools();
++        door.setCapacitySource("pools");
++
++        CacheException e = assertThrows(CacheException.class,
++              () -> door.getCapacity(PATH, subject, Restrictions.none()));
++        assertThat(e.getRc(), is(CacheException.SERVICE_UNAVAILABLE));
++    }
++
++    @Test
++    public void shouldReturnSpaceOfWriteToken() throws Exception {
++        givenWriteToken("42");
++        givenSpaceLookup(token -> token.equals("42")
++              ? Optional.of(space(1000, 300, 200)) : Optional.empty());
++        door.setCapacitySource("reservation");
++
++        Capacity capacity = door.getCapacity(PATH, subject, Restrictions.none());
++
++        assertThat(capacity.getTotalSpace(), is(1000L));
++        assertThat(capacity.getFreeSpace(), is(500L));
++        assertThat(capacity.getReservation(), is(Optional.of("42")));
++    }
++
++    @Test
++    public void shouldPreferConfiguredReservationOverWriteToken() throws Exception {
++        givenWriteToken("7");
++        givenSpaceLookup(token -> token.equals("42")
++              ? Optional.of(space(1000, 300, 200)) : Optional.empty());
++        door.setCapacitySource("reservation");
++        door.setCapacityReservation("42");
++
++        Capacity capacity = door.getCapacity(PATH, subject, Restrictions.none());
++
++        assertThat(capacity.getReservation(), is(Optional.of("42")));
 +    }
 +
 +    @Test
 +    public void shouldFailWithoutWriteToken() {
 +        givenWriteToken(null);
 +        givenSpaceLookup(token -> Optional.empty());
++        door.setCapacitySource("reservation");
 +
 +        CacheException e = assertThrows(CacheException.class,
-+              () -> door.getWriteTokenSpace(PATH, subject, Restrictions.none()));
++              () -> door.getCapacity(PATH, subject, Restrictions.none()));
 +        assertThat(e.getRc(), is(CacheException.INVALID_ARGS));
 +    }
 +
@@ -352,9 +459,10 @@ index 0000000000..a32a439f50
 +    public void shouldFailIfSpaceReservationNotFound() {
 +        givenWriteToken("42");
 +        givenSpaceLookup(token -> Optional.empty());
++        door.setCapacitySource("reservation");
 +
 +        assertThrows(CacheException.class,
-+              () -> door.getWriteTokenSpace(PATH, subject, Restrictions.none()));
++              () -> door.getCapacity(PATH, subject, Restrictions.none()));
 +    }
 +
 +    @Test
@@ -366,23 +474,39 @@ index 0000000000..a32a439f50
 +                throw new TimeoutCacheException("timeout");
 +            }
 +        }));
++        door.setCapacitySource("reservation");
 +
 +        assertThrows(TimeoutCacheException.class,
-+              () -> door.getWriteTokenSpace(PATH, subject, Restrictions.none()));
++              () -> door.getCapacity(PATH, subject, Restrictions.none()));
 +    }
 +
 +    @Test
 +    public void shouldFormatSpaceInfoLikeXrootdOss() {
-+        assertThat(XrootdRedirectHandler.toSpaceInfo(space(1000, 300, 200)),
++        assertThat(XrootdRedirectHandler.toSpaceInfo(Capacity.of(space(1000, 300, 200))),
 +              is("oss.cgroup=42&oss.space=1000&oss.free=500&oss.maxf=500"
 +                    + "&oss.used=500&oss.quota=1000"));
 +    }
 +
 +    @Test
-+    public void shouldNotReportNegativeFreeSpace() {
-+        assertThat(XrootdRedirectHandler.toSpaceInfo(space(100, 80, 50)),
-+              is("oss.cgroup=42&oss.space=100&oss.free=0&oss.maxf=0"
-+                    + "&oss.used=100&oss.quota=100"));
++    public void shouldUsePublicSpaceGroupWithoutReservation() {
++        long size = 1L << 60;
++        assertThat(XrootdRedirectHandler.toSpaceInfo(Capacity.UNKNOWN),
++              is("oss.cgroup=public&oss.space=" + size + "&oss.free=" + size + "&oss.maxf="
++                    + size + "&oss.used=0&oss.quota=" + size));
++    }
++
++    private void givenPools(PoolCostInfo... pools) {
++        CostModule costModule = mock(CostModule.class);
++        when(costModule.getPoolCostInfos()).thenReturn(Arrays.asList(pools));
++        PoolMonitor poolMonitor = mock(PoolMonitor.class);
++        when(poolMonitor.getCostModule()).thenReturn(costModule);
++        door.setPoolMonitor(poolMonitor);
++    }
++
++    private static PoolCostInfo pool(String name, long total, long free, long removable) {
++        PoolCostInfo info = new PoolCostInfo(name, "regular");
++        info.setSpaceUsage(total, free, 0, removable);
++        return info;
 +    }
 +
 +    private void givenWriteToken(String token) {
@@ -410,18 +534,39 @@ index 0000000000..a32a439f50
 +    }
 +}
 diff --git a/skel/share/defaults/xrootd.properties b/skel/share/defaults/xrootd.properties
-index 0d97a26528..4a484dd26a 100644
+index 0d97a26..ef5e83c 100644
 --- a/skel/share/defaults/xrootd.properties
 +++ b/skel/share/defaults/xrootd.properties
-@@ -77,6 +77,15 @@ xrootd.service.pinmanager=${dcache.service.pinmanager}
+@@ -55,6 +55,22 @@ xrootd.limits.login-cache.size=500
+ # Whether space reservations are supported
+ (one-of?true|false|${dcache.enable.space-reservation})xrootd.enable.space-reservation=${dcache.enable.space-reservation}
+ 
++# Source of the capacity reported in reply to space queries (kXR_Qspace,
++# e.g., xrdfs spaceinfo or df on an xrootdfs mount). See
++# dcache.capacity.source for the possible values.
++#
++# With 'namespace' (the default), the door reports a fixed size of 1 EiB,
++# all of which is free. With 'reservation' and an empty
++# xrootd.capacity.reservation, the door reports the space reservation
++# given by the WriteToken directory tag of the queried path; paths without
++# that tag are rejected.
++(one-of?namespace|pools|reservation|${dcache.capacity.source})xrootd.capacity.source = ${dcache.capacity.source}
++
++# Space token of the reservation reported if xrootd.capacity.source is
++# 'reservation', regardless of the queried path. If empty, the WriteToken
++# directory tag of the queried path is used.
++xrootd.capacity.reservation = ${dcache.capacity.reservation}
++
+ # ---- Whether to expect the haproxy Proxy Protocol
+ #
+ # Many load balancers and reverse proxies support the Proxy Protocol, a
+@@ -77,6 +93,13 @@ xrootd.service.pinmanager=${dcache.service.pinmanager}
  xrootd.service.pinmanager.timeout=300000
  (one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)xrootd.service.pinmanager.timeout.unit=MILLISECONDS
  
 +# Cell address of spacemanager service
 +#
-+# Used to answer kXR_Qspace queries (e.g., xrdfs spaceinfo, df on an
-+# xrootdfs mount) with the space reservation given by the WriteToken
-+# tag of the queried path. Only used if space reservation is enabled.
++# Only used if xrootd.capacity.source is 'reservation'.
 +xrootd.service.spacemanager=${dcache.service.spacemanager}
 +xrootd.service.spacemanager.timeout=30000
 +(one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)xrootd.service.spacemanager.timeout.unit=MILLISECONDS
@@ -430,5 +575,5 @@ index 0d97a26528..4a484dd26a 100644
  xrootd.service.poolmanager=${xrootd.service.poolmanager-space-${xrootd.enable.space-reservation}}
  (immutable)xrootd.service.poolmanager-space-false=${dcache.service.poolmanager}
 -- 
-2.52.0
+2.47.3
 

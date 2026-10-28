@@ -108,7 +108,7 @@ jobs:
         working-directory: dcache
         run: >
           mvn -B -q -am -pl modules/dcache-chimera,modules/dcache-xrootd install
-          -Dtest='DCacheAwareJdbcFsTest,XrootdDoor*Test'
+          -Dtest='CapacityTest,DCacheAwareJdbcFsTest,XrootdDoor*Test'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dmaven.javadoc.skip=true
 

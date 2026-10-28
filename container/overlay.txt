@@ -7,7 +7,9 @@
 #
 # Keep this list in sync with the modules touched by patches/*.patch.
 share/classes/dcache-chimera-${VERSION}.jar
+share/classes/dcache-core-${VERSION}.jar
 share/classes/dcache-nfs-${VERSION}.jar
 share/classes/dcache-xrootd-${VERSION}.jar
+share/defaults/dcache.properties
 share/defaults/nfs.properties
 share/defaults/xrootd.properties

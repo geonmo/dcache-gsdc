@@ -1,8 +1,8 @@
-From 63acc9603eca724b7746578a271b5fe17fab609a Mon Sep 17 00:00:00 2001
+From 3a46551449c2e7fe948c5924b4d3311a17280026 Mon Sep 17 00:00:00 2001
 From: Geonmo Ryu <geonmo@kisti.re.kr>
-Date: Tue, 27 Oct 2026 17:47:02 +0900
-Subject: [PATCH 1/2] nfs: optionally report file system size based on a space
- reservation
+Date: Wed, 28 Oct 2026 10:14:26 +0900
+Subject: [PATCH 2/3] nfs: optionally report the capacity of the pools or a
+ space reservation
 
 Motivation:
 The NFS door reports a fixed total size of 1 EiB and the space used by
@@ -11,20 +11,25 @@ meaningless size and free space, which makes them useless for users and
 for monitoring.
 
 Modification:
-Add the nfs.fs-stat.space-token property. If set, DCacheAwareJdbcFs
-looks up the space reservation through SpaceManager (using the existing
-ReservationCaches space lookup cache) and reports the reservation size
-as total space and the space no longer available in the reservation
-(used and allocated) as used space. File counts are still taken from the
-namespace. If the reservation can't be looked up, the namespace
-statistics are reported as before.
+Add the nfs.capacity.source and nfs.capacity.reservation properties,
+which default to dcache.capacity.source and dcache.capacity.reservation.
+With 'pools', DCacheAwareJdbcFs reports the total and free space summed
+over all online pools. With 'reservation', it looks up the configured
+space reservation through SpaceManager (using the existing
+ReservationCaches space lookup cache) and reports its size and the space
+still available in it.
 
-The property is empty by default, in which case the behaviour is
-unchanged and SpaceManager isn't contacted.
+As NFS doesn't tell the door which export a request is for, the door
+can't use the WriteToken tag; with 'reservation', a space token must be
+configured, and the door fails to start otherwise.
+
+File counts are still taken from the namespace. If the capacity can't be
+determined, the namespace statistics are reported as before.
 
 Result:
 Sites can configure the NFS door so that df shows the size and free
-space of a space reservation.
+space of the pools or of a space reservation. By default, the behaviour
+is unchanged.
 
 Fixes: #8275
 Target: master
@@ -32,47 +37,65 @@ Require-book: yes
 Require-notes: yes
 Signed-off-by: Geonmo Ryu <geonmo@kisti.re.kr>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Q2bGtq8WdR49xdKuc2BaVc
 ---
- docs/TheBook/src/main/markdown/config-nfs.md  |  19 +++
- .../org/dcache/chimera/DCacheAwareJdbcFs.java |  69 ++++++++-
- .../dcache/chimera/DCacheAwareJdbcFsTest.java | 141 ++++++++++++++++++
- .../chimera/nfsv41/door/nfsv41-common.xml     |  15 ++
- skel/share/defaults/nfs.properties            |  20 +++
- 5 files changed, 263 insertions(+), 1 deletion(-)
+ docs/TheBook/src/main/markdown/config-nfs.md  |  36 +++
+ .../org/dcache/chimera/DCacheAwareJdbcFs.java |  83 ++++++-
+ .../dcache/chimera/DCacheAwareJdbcFsTest.java | 208 ++++++++++++++++++
+ .../chimera/nfsv41/door/nfsv41-common.xml     |  18 +-
+ skel/share/defaults/nfs.properties            |  28 +++
+ 5 files changed, 371 insertions(+), 2 deletions(-)
  create mode 100644 modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
 
 diff --git a/docs/TheBook/src/main/markdown/config-nfs.md b/docs/TheBook/src/main/markdown/config-nfs.md
-index af594c3ec1..2d24dbe596 100644
+index af594c3..f444152 100644
 --- a/docs/TheBook/src/main/markdown/config-nfs.md
 +++ b/docs/TheBook/src/main/markdown/config-nfs.md
-@@ -253,6 +253,25 @@ it false.
+@@ -253,6 +253,42 @@ it false.
  > NOTICE: currently only the [ldap](config-gplazma.md#ldap) plugin supports group mapping by uid when `gplazma.ldap.try-uid-mapping` option is enabled.
  
  
 +## Reporting file system size
 +
 +By default, the NFS door reports a fixed total size of 1 EiB and the space used by all files in the
-+namespace, which makes the output of tools like `df` of little use. Alternatively, the door can report
-+the size and usage of a space reservation:
++namespace, which makes the output of tools like `df` of little use. The door can instead report the
++capacity of the pools or of a space reservation, as selected by `nfs.capacity.source`:
++
++| Value | Reported size | Reported free space |
++|---|---|---|
++| `namespace` (default) | 1 EiB | 1 EiB minus the size of all files in the namespace |
++| `pools` | Sum of the total space of all online pools | Sum of the free and removable space of those pools |
++| `reservation` | Size of the space reservation | Space neither used nor allocated in the reservation |
++
++For example, to report the space reservation with the token 1234:
 +
 +```ini
-+nfs.fs-stat.space-token = 1234
++nfs.capacity.source = reservation
++nfs.capacity.reservation = 1234
 +```
 +
-+With this configuration the total size is the size of the space reservation, and the free space is
-+the space that is still available in it, i.e., neither used nor allocated. The number of files is
-+still taken from the namespace. If the space reservation can't be looked up, the door reports the
-+default values.
++As NFS clients don't tell the door which export a request is for, the door can't use the
++`WriteToken` tag of a directory to find the space reservation, and a single reservation is reported
++for all exports of a door. If `nfs.capacity.source` is `reservation` and
++`nfs.capacity.reservation` is empty, the door fails to start. Sites that need different values
++for different exports have to run separate doors.
 +
-+As the NFS protocol has no notion of per-directory size, a single space reservation is used for all
-+exports of a door. The values are cached by the door for `nfs.fs-stat-cache.time`, which may need to
-+be lowered for clients to see changes in a timely manner.
++With `pools`, files that exist only on tape aren't counted, so on tape-backed instances the reported
++used space may be much smaller than the size of all files.
++
++The number of files is always taken from the namespace. If the pools or the space reservation
++can't be looked up, the door reports the default values. The values are cached for
++`nfs.fs-stat-cache.time`, which may need to be lowered for clients to see changes promptly.
++
++Both properties default to `dcache.capacity.source` and `dcache.capacity.reservation`, which the
++xrootd door uses as well.
++
 +
  ## Remote Quota Management
  
  The NFSv4.1 door supports remote quota protocol, which allows to query user and group quotas. Only files with
 diff --git a/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java b/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java
-index 1264ac57e9..4dfe461be1 100644
+index 1264ac5..658de0a 100644
 --- a/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java
 +++ b/modules/dcache-chimera/src/main/java/org/dcache/chimera/DCacheAwareJdbcFs.java
 @@ -60,7 +60,10 @@ documents or software obtained from this server.
@@ -94,21 +117,24 @@ index 1264ac57e9..4dfe461be1 100644
  import java.util.stream.Collectors;
  import javax.security.auth.Subject;
  import javax.sql.DataSource;
-@@ -97,6 +101,8 @@ import org.dcache.pinmanager.PinManagerPinMessage;
+@@ -96,7 +100,10 @@ import org.dcache.pinmanager.PinManagerListPinsMessage.Info;
+ import org.dcache.pinmanager.PinManagerPinMessage;
  import org.dcache.pinmanager.PinManagerUnpinMessage;
  import org.dcache.poolmanager.RemotePoolMonitor;
++import org.dcache.space.Capacity;
  import org.dcache.vehicles.FileAttributes;
 +import org.slf4j.Logger;
 +import org.slf4j.LoggerFactory;
  import org.springframework.beans.factory.annotation.Required;
  import org.springframework.transaction.PlatformTransactionManager;
  
-@@ -104,12 +110,14 @@ import org.springframework.transaction.PlatformTransactionManager;
+@@ -104,12 +111,15 @@ import org.springframework.transaction.PlatformTransactionManager;
  /**
   * Overrides protected methods so as to be able to provide live locality information if requested;
   * the latter calls the PNFS and Pool managers. Also implements requests to pin manager for STAGE
 - * command.
-+ * command and, optionally, reports file system statistics based on a space reservation.
++ * command and, optionally, reports the capacity of the pools or of a space reservation as file
++ * system statistics.
   *
   * @author arossi
   */
@@ -119,44 +145,47 @@ index 1264ac57e9..4dfe461be1 100644
      public class DcachePinInfo implements PinInfo {
  
          private final Instant creation;
-@@ -177,6 +185,13 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
+@@ -177,6 +187,13 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
       */
      private RemotePoolMonitor poolMonitor;
  
 +    /**
-+     * Space reservation used to report total and used space, or null to report namespace-wide
-+     * usage.
++     * Source of the total and used space reported as file system statistics.
 +     */
-+    private String fsStatSpaceToken;
++    private Capacity.Source capacitySource = Capacity.Source.NAMESPACE;
++    private Optional<String> capacityReservation = Optional.empty();
 +    private LoadingCache<String, Optional<Space>> spaceLookupCache;
 +
      @Required
      public void setQueryPnfsManagerOnRename(boolean yes) {
          queryPnfsManagerOnRename = yes;
-@@ -208,11 +223,63 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
+@@ -208,11 +225,75 @@ public class DCacheAwareJdbcFs extends JdbcFs implements CellIdentityAware {
          this.poolMonitor = poolMonitor;
      }
  
++    public void setCapacitySource(String source) {
++        capacitySource = Capacity.Source.fromProperty(source);
++    }
++
++    public void setCapacityReservation(String reservation) {
++        capacityReservation = Capacity.parseReservation(reservation);
++    }
++
 +    public void setSpaceLookupCache(LoadingCache<String, Optional<Space>> spaceLookupCache) {
 +        this.spaceLookupCache = spaceLookupCache;
 +    }
 +
 +    /**
-+     * Sets the space token of the reservation used to report file system statistics. An empty
-+     * value disables the feature.
++     * Checks that the capacity configuration is complete. As NFS doesn't tell the file system
++     * which export a statfs request is for, a space reservation can't be found through the
++     * WriteToken tag and must be configured explicitly.
 +     */
-+    public void setFsStatSpaceToken(String token) {
-+        String trimmed = token == null ? "" : token.strip();
-+        if (trimmed.isEmpty()) {
-+            fsStatSpaceToken = null;
-+            return;
++    public void checkCapacityConfiguration() {
++        if (capacitySource == Capacity.Source.RESERVATION && capacityReservation.isEmpty()) {
++            throw new IllegalArgumentException("nfs.capacity.source=reservation requires"
++                  + " nfs.capacity.reservation to be set, as the NFS door can't use the"
++                  + " WriteToken tag of a path.");
 +        }
-+        try {
-+            Long.parseLong(trimmed);
-+        } catch (NumberFormatException e) {
-+            throw new IllegalArgumentException("Invalid space token: " + token);
-+        }
-+        fsStatSpaceToken = trimmed;
 +    }
 +
      @Override
@@ -165,33 +194,42 @@ index 1264ac57e9..4dfe461be1 100644
      }
  
 +    /**
-+     * Reports the size of the configured space reservation as total space and the space no longer
-+     * available in that reservation (used and allocated) as used space. File counts are taken from
-+     * the namespace. Falls back to namespace-wide statistics if no space token is configured or the
-+     * reservation cannot be looked up.
++     * Reports the total and used space of the configured capacity source. File counts are always
++     * taken from the namespace. Falls back to namespace statistics if the capacity can't be
++     * determined.
 +     */
 +    @Override
 +    public FsStat getFsStat() throws ChimeraFsException {
 +        FsStat fsStat = super.getFsStat();
-+        if (fsStatSpaceToken == null) {
++        if (capacitySource == Capacity.Source.NAMESPACE) {
 +            return fsStat;
 +        }
 +
 +        try {
-+            Space space = spaceLookupCache.get(fsStatSpaceToken).orElse(null);
-+            if (space != null) {
-+                long size = space.getSizeInBytes();
-+                long available = Math.max(0L, space.getAvailableSpaceInBytes());
-+                return new FsStat(size, fsStat.getTotalFiles(), size - available,
-+                      fsStat.getUsedFiles());
-+            }
-+            LOGGER.warn("Space reservation {} not found; reporting namespace statistics.",
-+                  fsStatSpaceToken);
++            Capacity capacity = getCapacity();
++            return new FsStat(capacity.getTotalSpace(), fsStat.getTotalFiles(),
++                  capacity.getUsedSpace(), fsStat.getUsedFiles());
++        } catch (CacheException e) {
++            LOGGER.warn("{}; reporting namespace statistics.", e.getMessage());
 +        } catch (ExecutionException | UncheckedExecutionException e) {
-+            LOGGER.warn("Failed to look up space reservation {}: {}", fsStatSpaceToken,
-+                  e.getCause().getMessage());
++            LOGGER.warn("Failed to look up space reservation {}: {}; reporting namespace"
++                  + " statistics.", capacityReservation.orElse(""), e.getCause().getMessage());
 +        }
 +        return fsStat;
++    }
++
++    private Capacity getCapacity() throws CacheException, ExecutionException {
++        switch (capacitySource) {
++            case POOLS:
++                return Capacity.ofPools(poolMonitor).orElseThrow(
++                      () -> new CacheException("Pool information is not available"));
++            case RESERVATION:
++                String token = capacityReservation.orElseThrow();
++                return spaceLookupCache.get(token).map(Capacity::of).orElseThrow(
++                      () -> new CacheException("Space reservation " + token + " not found"));
++            default:
++                throw new IllegalStateException("Unexpected capacity source: " + capacitySource);
++        }
 +    }
 +
      @Override
@@ -199,19 +237,23 @@ index 1264ac57e9..4dfe461be1 100644
          FsInode pathInode = new FsInode(DCacheAwareJdbcFs.this, node.ino());
 diff --git a/modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java b/modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
 new file mode 100644
-index 0000000000..f39e0bed9d
+index 0000000..88a594d
 --- /dev/null
 +++ b/modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,208 @@
 +package org.dcache.chimera;
 +
 +import static org.junit.Assert.assertEquals;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
 +
 +import com.google.common.cache.CacheBuilder;
 +import com.google.common.cache.CacheLoader;
 +import com.google.common.cache.LoadingCache;
 +import com.google.common.io.Resources;
 +import com.zaxxer.hikari.HikariDataSource;
++import diskCacheV111.poolManager.CostModule;
++import diskCacheV111.pools.PoolCostInfo;
 +import diskCacheV111.services.space.Space;
 +import diskCacheV111.services.space.SpaceState;
 +import diskCacheV111.util.AccessLatency;
@@ -220,6 +262,7 @@ index 0000000000..f39e0bed9d
 +import java.io.InputStream;
 +import java.net.URL;
 +import java.sql.Connection;
++import java.util.Arrays;
 +import java.util.Optional;
 +import java.util.Properties;
 +import liquibase.Liquibase;
@@ -227,6 +270,7 @@ index 0000000000..f39e0bed9d
 +import liquibase.database.DatabaseFactory;
 +import liquibase.database.jvm.JdbcConnection;
 +import liquibase.resource.ClassLoaderResourceAccessor;
++import org.dcache.poolmanager.RemotePoolMonitor;
 +import org.junit.After;
 +import org.junit.Before;
 +import org.junit.Test;
@@ -276,16 +320,48 @@ index 0000000000..f39e0bed9d
 +    }
 +
 +    @Test
-+    public void shouldReportNamespaceStatisticsWithoutSpaceToken() throws Exception {
-+        fs.setFsStatSpaceToken("");
++    public void shouldReportNamespaceStatisticsByDefault() throws Exception {
++        assertEquals(JdbcFs.AVAILABLE_SPACE, fs.getFsStat().getTotalSpace());
++    }
++
++    @Test
++    public void shouldReportNamespaceStatisticsForNamespaceSource() throws Exception {
++        fs.setCapacitySource("namespace");
++        fs.setCapacityReservation("42");
++        fs.checkCapacityConfiguration();
++
++        assertEquals(JdbcFs.AVAILABLE_SPACE, fs.getFsStat().getTotalSpace());
++    }
++
++    @Test
++    public void shouldReportSpaceOfAllPools() throws Exception {
++        givenPools(pool("pool1", 1000, 100, 50), pool("pool2", 2000, 300, 0));
++        fs.setCapacitySource("pools");
++        fs.checkCapacityConfiguration();
++
++        FsStat stat = fs.getFsStat();
++
++        assertEquals(3000, stat.getTotalSpace());
++        assertEquals(2550, stat.getUsedSpace());
++        assertEquals(namespaceStat.getTotalFiles(), stat.getTotalFiles());
++        assertEquals(namespaceStat.getUsedFiles(), stat.getUsedFiles());
++    }
++
++    @Test
++    public void shouldFallBackIfPoolInformationIsNotAvailable() throws Exception {
++        givenPools();
++        fs.setCapacitySource("pools");
 +
 +        assertEquals(JdbcFs.AVAILABLE_SPACE, fs.getFsStat().getTotalSpace());
 +    }
 +
 +    @Test
 +    public void shouldReportSpaceReservationSizeAndUsage() throws Exception {
-+        givenSpaceLookup(token -> Optional.of(space(1000, 300, 200)));
-+        fs.setFsStatSpaceToken("42");
++        givenSpaceLookup(token -> token.equals("42")
++              ? Optional.of(space(1000, 300, 200)) : Optional.empty());
++        fs.setCapacitySource("reservation");
++        fs.setCapacityReservation("42");
++        fs.checkCapacityConfiguration();
 +
 +        FsStat stat = fs.getFsStat();
 +
@@ -298,7 +374,8 @@ index 0000000000..f39e0bed9d
 +    @Test
 +    public void shouldNotReportMoreUsedThanTotalSpace() throws Exception {
 +        givenSpaceLookup(token -> Optional.of(space(100, 80, 50)));
-+        fs.setFsStatSpaceToken("42");
++        fs.setCapacitySource("reservation");
++        fs.setCapacityReservation("42");
 +
 +        FsStat stat = fs.getFsStat();
 +
@@ -309,7 +386,8 @@ index 0000000000..f39e0bed9d
 +    @Test
 +    public void shouldFallBackIfSpaceReservationNotFound() throws Exception {
 +        givenSpaceLookup(token -> Optional.empty());
-+        fs.setFsStatSpaceToken("42");
++        fs.setCapacitySource("reservation");
++        fs.setCapacityReservation("42");
 +
 +        assertEquals(JdbcFs.AVAILABLE_SPACE, fs.getFsStat().getTotalSpace());
 +    }
@@ -322,14 +400,41 @@ index 0000000000..f39e0bed9d
 +                throw new TimeoutCacheException("timeout");
 +            }
 +        }));
-+        fs.setFsStatSpaceToken("42");
++        fs.setCapacitySource("reservation");
++        fs.setCapacityReservation("42");
 +
 +        assertEquals(JdbcFs.AVAILABLE_SPACE, fs.getFsStat().getTotalSpace());
 +    }
 +
 +    @Test(expected = IllegalArgumentException.class)
-+    public void shouldRejectNonNumericSpaceToken() {
-+        fs.setFsStatSpaceToken("CMS_DISK");
++    public void shouldRequireSpaceReservationForReservationSource() {
++        fs.setCapacitySource("reservation");
++        fs.setCapacityReservation("");
++        fs.checkCapacityConfiguration();
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void shouldRejectNonNumericSpaceReservation() {
++        fs.setCapacityReservation("CMS_DISK");
++    }
++
++    @Test(expected = IllegalArgumentException.class)
++    public void shouldRejectUnknownCapacitySource() {
++        fs.setCapacitySource("42");
++    }
++
++    private void givenPools(PoolCostInfo... pools) {
++        CostModule costModule = mock(CostModule.class);
++        when(costModule.getPoolCostInfos()).thenReturn(Arrays.asList(pools));
++        RemotePoolMonitor poolMonitor = mock(RemotePoolMonitor.class);
++        when(poolMonitor.getCostModule()).thenReturn(costModule);
++        fs.setPoolMonitor(poolMonitor);
++    }
++
++    private static PoolCostInfo pool(String name, long total, long free, long removable) {
++        PoolCostInfo info = new PoolCostInfo(name, "regular");
++        info.setSpaceUsage(total, free, 0, removable);
++        return info;
 +    }
 +
 +    private void givenSpaceLookup(
@@ -345,7 +450,7 @@ index 0000000000..f39e0bed9d
 +    }
 +}
 diff --git a/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml b/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml
-index 08c30e8bee..25fa76f3ed 100644
+index 08c30e8..cde07ea 100644
 --- a/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml
 +++ b/modules/dcache-nfs/src/main/resources/org/dcache/chimera/nfsv41/door/nfsv41-common.xml
 @@ -50,6 +50,13 @@
@@ -362,11 +467,21 @@ index 08c30e8bee..25fa76f3ed 100644
      <bean id="scheduled-thread-pool"
            class="org.dcache.util.CDCScheduledExecutorServiceDecorator"
            destroy-method="shutdown">
-@@ -149,6 +156,14 @@
+@@ -137,7 +144,7 @@
+ 
+ 
+     <bean id="fileSystem" class="org.dcache.chimera.DCacheAwareJdbcFs"
+-            depends-on="liquibase">
++            depends-on="liquibase" init-method="checkCapacityConfiguration">
+         <description>Chimera Filesystem</description>
+         <constructor-arg ref="dataSource" />
+         <constructor-arg ref="tx-manager" />
+@@ -149,6 +156,15 @@
  	<property name="queryPnfsManagerOnRename" value="${nfs.enable.pnfsmanager-query-on-move}"/>
  	<property name="quota" ref="quota-system"/>
  	<property name="quotaEnabled" value="${nfs.enable.quota}"/>
-+        <property name="fsStatSpaceToken" value="${nfs.fs-stat.space-token}"/>
++        <property name="capacitySource" value="${nfs.capacity.source}"/>
++        <property name="capacityReservation" value="${nfs.capacity.reservation}"/>
 +        <property name="spaceLookupCache">
 +            <bean class="org.dcache.space.ReservationCaches"
 +                  factory-method="buildSpaceLookupCache">
@@ -378,14 +493,16 @@ index 08c30e8bee..25fa76f3ed 100644
  
      </bean>
 diff --git a/skel/share/defaults/nfs.properties b/skel/share/defaults/nfs.properties
-index d087ec4006..0c0373d9e5 100644
+index d087ec4..0936bc5 100644
 --- a/skel/share/defaults/nfs.properties
 +++ b/skel/share/defaults/nfs.properties
-@@ -167,6 +167,11 @@ nfs.service.pinmanager=${dcache.service.pinmanager}
+@@ -167,6 +167,13 @@ nfs.service.pinmanager=${dcache.service.pinmanager}
  nfs.service.pinmanager.timeout=300000
  (one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)nfs.service.pinmanager.timeout.unit=MILLISECONDS
  
 +# Cell address of spacemanager service
++#
++# Only used if nfs.capacity.source is 'reservation'.
 +nfs.service.spacemanager=${dcache.service.spacemanager}
 +nfs.service.spacemanager.timeout=30000
 +(one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)nfs.service.spacemanager.timeout.unit=MILLISECONDS
@@ -393,28 +510,34 @@ index d087ec4006..0c0373d9e5 100644
  nfs.service.pool.timeout = 10000
  (one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)nfs.service.pool.timeout.unit=MILLISECONDS
  
-@@ -230,6 +235,21 @@ nfs.namespace-cache.size = 0
+@@ -230,6 +237,27 @@ nfs.namespace-cache.size = 0
  nfs.fs-stat-cache.time = 3600
  (one-of?MILLISECONDS|SECONDS|MINUTES|HOURS|DAYS)nfs.fs-stat-cache.time.unit = SECONDS
  
-+# Space reservation used for file system statistics.
++# Source of the file system size and free space reported to clients
++# (e.g., by df). See dcache.capacity.source for the possible values.
 +#
-+# By default, the door reports a fixed total size of 1 EiB and the space
-+# used by all files in the namespace. If set to a space token, the total
-+# size reported to clients (e.g., by df) is the size of that space
-+# reservation, and the free space is the space still available in it
-+# (neither used nor allocated). File counts are still taken from the
-+# namespace. If the reservation cannot be looked up, the door falls back
-+# to the default behaviour.
++# With 'namespace' (the default), the door reports a fixed size of 1 EiB
++# and the space used by all files in the namespace.
 +#
-+# The reported values are cached by the door for nfs.fs-stat-cache.time.
++# With 'reservation', nfs.capacity.reservation must be set, as NFS clients
++# don't tell the door which export a statfs request is for; the door fails
++# to start otherwise. Consequently, a single space reservation is reported
++# for all exports of the door.
 +#
-+# An empty value disables this feature.
-+nfs.fs-stat.space-token =
++# File counts are always taken from the namespace. If the pools or the
++# space reservation can't be looked up, the door falls back to the
++# namespace statistics. The reported values are cached for
++# nfs.fs-stat-cache.time.
++(one-of?namespace|pools|reservation|${dcache.capacity.source})nfs.capacity.source = ${dcache.capacity.source}
++
++# Space token of the reservation reported if nfs.capacity.source is
++# 'reservation'.
++nfs.capacity.reservation = ${dcache.capacity.reservation}
 +
  
  #
  # Directory listing cache size. NOTICE, that this is the number of directories to cache,
 -- 
-2.52.0
+2.47.3
 
