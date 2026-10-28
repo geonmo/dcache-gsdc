@@ -109,9 +109,16 @@ jobs:
           git log --reverse --format='- %s' -n "$(ls "$GITHUB_WORKSPACE"/site/patches/*.patch | wc -l)" \
             > "$GITHUB_WORKSPACE"/patches.txt
 
-      - uses: actions/cache@v4
+      # The job runs in a container, where ~ differs between actions/cache and
+      # maven, so the local repository is kept in the workspace instead. dCache's
+      # own artifacts are rebuilt every time and are not cached.
+      - name: Restore maven repository
+        id: maven-cache
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.m2/repository
+          path: |
+            .m2/repository
+            !.m2/repository/org/dcache
           key: maven-${{ hashFiles('dcache/**/pom.xml') }}
           restore-keys: maven-
 
@@ -119,6 +126,7 @@ jobs:
         working-directory: dcache
         run: >
           mvn -B -q -am -pl modules/dcache-chimera,modules/dcache-xrootd install
+          -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
           -Dtest='CapacityTest,DCacheAwareJdbcFsTest,XrootdDoor*Test'
           -Dsurefire.failIfNoSpecifiedTests=false
           -Dmaven.javadoc.skip=true
@@ -127,8 +135,20 @@ jobs:
         working-directory: dcache
         run: >
           mvn -B -q -am -pl packages/fhs,packages/tar -P rpm package
+          -Dmaven.repo.local="$GITHUB_WORKSPACE/.m2/repository"
           -DskipTests -Dmaven.javadoc.skip=true
           -Dbuild.id="$BUILD_ID" -Dlocal.version="$LOCAL_VERSION"
+
+      # Saved even if the build failed, so that the dependencies downloaded so
+      # far need not be fetched again from slow or unreachable repositories.
+      - name: Save maven repository
+        if: always() && steps.maven-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .m2/repository
+            !.m2/repository/org/dcache
+          key: maven-${{ hashFiles('dcache/**/pom.xml') }}
 
       - uses: actions/upload-artifact@v4
         with:
