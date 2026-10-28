@@ -1,4 +1,4 @@
-From 34984797579e055a4ae225f42be08be062e92890 Mon Sep 17 00:00:00 2001
+From 4e1152ac4eb39285fc726011f75a083b1c797acf Mon Sep 17 00:00:00 2001
 From: Geonmo Ryu <geonmo@kisti.re.kr>
 Date: Wed, 28 Oct 2026 12:00:13 +0900
 Subject: [PATCH] nfs, xrootd: report the capacity of the pools or a space
@@ -17,7 +17,11 @@ xrootd.capacity.source:
 - namespace (default): a fixed 1 EiB, as the NFS door reports today
 - pools: the total and free space of the pools that files in the
   queried path are first written to, counting removable replicas as
-  free, as the frontend does for SRR; 1 EiB if no write link matches
+  free, as the frontend does for SRR; 1 EiB if no write link matches.
+  With space reservation, link groups are chosen as the spacemanager
+  does: that of the WriteToken, or else a matching one as if unreserved
+  uploads to link groups were allowed, since doors can't see that
+  spacemanager setting
 - reservation: the size and available space of the space reservation
   given by the WriteToken tag of the queried path, as the FTP door does
   for SITE USAGE, or as 'pools' for paths without one
@@ -44,19 +48,19 @@ Signed-off-by: Geonmo Ryu <geonmo@kisti.re.kr>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01Q2bGtq8WdR49xdKuc2BaVc
 ---
- .../org/dcache/chimera/DCacheAwareJdbcFs.java |  30 ++-
- .../dcache/chimera/DCacheAwareJdbcFsTest.java | 107 +++++++++
+ .../org/dcache/chimera/DCacheAwareJdbcFs.java |  30 +-
+ .../dcache/chimera/DCacheAwareJdbcFsTest.java | 107 +++++++
  .../chimera/nfsv41/door/nfsv41-common.xml     |  20 ++
  .../org/dcache/xrootd/door/XrootdDoor.java    |  19 ++
- .../xrootd/door/XrootdRedirectHandler.java    |  32 +++
- .../org/dcache/xrootd/door/xrootd.xml         |  19 ++
- .../xrootd/door/XrootdDoorSpaceQueryTest.java |  61 +++++
- .../main/java/org/dcache/space/Capacity.java  | 215 ++++++++++++++++++
- .../java/org/dcache/space/CapacityTest.java   | 178 +++++++++++++++
- skel/share/defaults/dcache.properties         |  12 +
+ .../xrootd/door/XrootdRedirectHandler.java    |  32 ++
+ .../org/dcache/xrootd/door/xrootd.xml         |  22 ++
+ .../xrootd/door/XrootdDoorSpaceQueryTest.java |  61 ++++
+ .../main/java/org/dcache/space/Capacity.java  | 289 ++++++++++++++++++
+ .../java/org/dcache/space/CapacityTest.java   | 239 +++++++++++++++
+ skel/share/defaults/dcache.properties         |  16 +
  skel/share/defaults/nfs.properties            |  10 +
  skel/share/defaults/xrootd.properties         |   7 +
- 12 files changed, 709 insertions(+), 1 deletion(-)
+ 12 files changed, 851 insertions(+), 1 deletion(-)
  create mode 100644 modules/dcache-chimera/src/test/java/org/dcache/chimera/DCacheAwareJdbcFsTest.java
  create mode 100644 modules/dcache-xrootd/src/test/java/org/dcache/xrootd/door/XrootdDoorSpaceQueryTest.java
  create mode 100644 modules/dcache/src/main/java/org/dcache/space/Capacity.java
@@ -382,10 +386,24 @@ index 93aa401..73c7c6b 100644
      protected XrootdResponse<DirListRequest> doOnDirList(ChannelHandlerContext ctx,
            DirListRequest request)
 diff --git a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
-index a91b1da..4f85705 100644
+index a91b1da..18be3a2 100644
 --- a/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
 +++ b/modules/dcache-xrootd/src/main/resources/org/dcache/xrootd/door/xrootd.xml
-@@ -193,6 +193,25 @@
+@@ -56,6 +56,13 @@
+     <property name="timeoutUnit" value="${xrootd.service.poolmanager.timeout.unit}"/>
+   </bean>
+ 
++  <bean id="spacemanager-stub" class="org.dcache.cells.CellStub">
++    <description>Space manager communication stub</description>
++    <property name="destination" value="${xrootd.service.spacemanager}"/>
++    <property name="timeout" value="${xrootd.service.spacemanager.timeout}"/>
++    <property name="timeoutUnit" value="${xrootd.service.spacemanager.timeout.unit}"/>
++  </bean>
++
+   <bean id="billing-stub" class="org.dcache.cells.CellStub">
+     <description>Billing communication stub</description>
+     <property name="destination" value="${xrootd.service.billing}"/>
+@@ -193,6 +200,21 @@
        </bean>
      </property>
      <property name="billingStub" ref="billing-stub"/>
@@ -396,16 +414,12 @@ index a91b1da..4f85705 100644
 +        <constructor-arg ref="pool-monitor"/>
 +        <constructor-arg>
 +          <bean class="org.dcache.space.ReservationCaches" factory-method="buildSpaceLookupCache">
-+            <constructor-arg>
-+              <bean class="org.dcache.cells.CellStub">
-+                <property name="destination" value="${xrootd.service.spacemanager}"/>
-+                <property name="timeout" value="${xrootd.service.spacemanager.timeout}"/>
-+                <property name="timeoutUnit" value="${xrootd.service.spacemanager.timeout.unit}"/>
-+              </bean>
-+            </constructor-arg>
++            <constructor-arg ref="spacemanager-stub"/>
 +            <constructor-arg ref="scheduled-thread-pool"/>
 +          </bean>
 +        </constructor-arg>
++        <property name="spaceReservation" value="${xrootd.enable.space-reservation}"/>
++        <property name="spaceManager" ref="spacemanager-stub"/>
 +      </bean>
 +    </property>
      <property name="writePaths" value="${xrootd.authz.write-paths}"/>
@@ -480,10 +494,10 @@ index 0000000..9ac119a
 +}
 diff --git a/modules/dcache/src/main/java/org/dcache/space/Capacity.java b/modules/dcache/src/main/java/org/dcache/space/Capacity.java
 new file mode 100644
-index 0000000..48b82ba
+index 0000000..0da5d2e
 --- /dev/null
 +++ b/modules/dcache/src/main/java/org/dcache/space/Capacity.java
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,289 @@
 +/*
 + * dCache - http://www.dcache.org/
 + *
@@ -504,14 +518,20 @@ index 0000000..48b82ba
 + */
 +package org.dcache.space;
 +
++import com.google.common.cache.Cache;
++import com.google.common.cache.CacheBuilder;
 +import com.google.common.cache.LoadingCache;
 +import diskCacheV111.poolManager.CostModule;
 +import diskCacheV111.poolManager.PoolPreferenceLevel;
++import diskCacheV111.poolManager.PoolSelectionUnit;
 +import diskCacheV111.poolManager.PoolSelectionUnit.DirectionType;
 +import diskCacheV111.pools.PoolCostInfo;
 +import diskCacheV111.pools.PoolCostInfo.PoolSpaceInfo;
 +import diskCacheV111.services.space.Space;
++import diskCacheV111.services.space.message.GetLinkGroupsMessage;
 +import diskCacheV111.util.CacheException;
++import dmg.cells.nucleus.NoRouteToCellException;
++import java.util.ArrayList;
 +import java.util.List;
 +import java.util.Locale;
 +import java.util.Objects;
@@ -519,7 +539,9 @@ index 0000000..48b82ba
 +import java.util.Set;
 +import java.util.concurrent.ConcurrentHashMap;
 +import java.util.concurrent.ExecutionException;
++import java.util.concurrent.TimeUnit;
 +import java.util.stream.Collectors;
++import org.dcache.cells.CellStub;
 +import org.dcache.poolmanager.PoolMonitor;
 +import org.dcache.vehicles.FileAttributes;
 +import org.slf4j.Logger;
@@ -581,6 +603,10 @@ index 0000000..48b82ba
 +        private final PoolMonitor poolMonitor;
 +        private final LoadingCache<String, Optional<Space>> spaceLookupCache;
 +        private final Set<String> failing = ConcurrentHashMap.newKeySet();
++        private final Cache<Long, String> linkGroupNames = CacheBuilder.newBuilder()
++              .expireAfterWrite(10, TimeUnit.MINUTES).build();
++        private boolean spaceReservation;
++        private CellStub spaceManager;
 +
 +        public Provider(String source, String reservation, PoolMonitor poolMonitor,
 +              LoadingCache<String, Optional<Space>> spaceLookupCache) {
@@ -595,6 +621,17 @@ index 0000000..48b82ba
 +            }
 +            this.poolMonitor = poolMonitor;
 +            this.spaceLookupCache = spaceLookupCache;
++        }
++
++        /**
++         * Sets whether writes go through the spacemanager, which may select a link group.
++         */
++        public void setSpaceReservation(boolean spaceReservation) {
++            this.spaceReservation = spaceReservation;
++        }
++
++        public void setSpaceManager(CellStub spaceManager) {
++            this.spaceManager = spaceManager;
 +        }
 +
 +        public Source getSource() {
@@ -649,15 +686,67 @@ index 0000000..48b82ba
 +        }
 +
 +        private Capacity ofReservation(String token) throws CacheException {
++            Space space = space(token);
++            return new Capacity(space.getSizeInBytes(), space.getAvailableSpaceInBytes(), token);
++        }
++
++        private Space space(String token) throws CacheException {
 +            try {
-+                Space space = spaceLookupCache.get(token).orElseThrow(
++                return spaceLookupCache.get(token).orElseThrow(
 +                      () -> new CacheException("Space reservation " + token + " not found"));
-+                return new Capacity(space.getSizeInBytes(), space.getAvailableSpaceInBytes(),
-+                      token);
 +            } catch (ExecutionException e) {
 +                throw new CacheException("Failed to look up space reservation " + token + ": "
 +                      + e.getCause().getMessage(), e.getCause());
 +            }
++        }
++
++        private String linkGroupOf(String token) throws CacheException {
++            long id = space(token).getLinkGroupId();
++            String name = linkGroupNames.getIfPresent(id);
++            if (name == null) {
++                try {
++                    spaceManager.sendAndWait(new GetLinkGroupsMessage()).getLinkGroups()
++                          .forEach(group -> linkGroupNames.put(group.getId(), group.getName()));
++                } catch (NoRouteToCellException | InterruptedException e) {
++                    throw new CacheException(CacheException.SERVICE_UNAVAILABLE,
++                          "Failed to look up link groups: " + e.getMessage(), e);
++                }
++                name = linkGroupNames.getIfPresent(id);
++                if (name == null) {
++                    throw new CacheException("Link group of space reservation " + token
++                          + " not found");
++                }
++            }
++            return name;
++        }
++
++        /**
++         * Returns the pools a file in the path is first written to. With space reservation, these
++         * are the pools of the link group of the WriteToken or, without one, of a matching link
++         * group, as the spacemanager selects them if unreserved uploads to link groups are allowed
++         * (a setting doors cannot see), and otherwise of the links outside link groups.
++         */
++        private List<String> writePools(FileAttributes path, String host, String protocol)
++              throws CacheException {
++            PoolSelectionUnit psu = poolMonitor.getPoolSelectionUnit();
++            String token = path.getStorageInfo().getMap().get("writeToken");
++            List<String> linkGroups = new ArrayList<>();
++            if (spaceReservation && token != null) {
++                linkGroups.add(linkGroupOf(token));
++            } else {
++                if (spaceReservation) {
++                    linkGroups.addAll(psu.getLinkGroups().keySet());
++                }
++                linkGroups.add(null);
++            }
++            for (String linkGroup : linkGroups) {
++                PoolPreferenceLevel[] levels = psu.match(DirectionType.WRITE, host, protocol, path,
++                      linkGroup, pool -> false);
++                if (levels.length > 0 && !levels[0].getPoolList().isEmpty()) {
++                    return levels[0].getPoolList();
++                }
++            }
++            return List.of();
 +        }
 +
 +        /**
@@ -675,17 +764,16 @@ index 0000000..48b82ba
 +                    pools = costModule.getPoolCostInfos().stream()
 +                          .map(PoolCostInfo::getSpaceInfo).collect(Collectors.toList());
 +                } else {
-+                    PoolPreferenceLevel[] levels = poolMonitor.getPoolSelectionUnit()
-+                          .match(DirectionType.WRITE, host, protocol, path, null, pool -> false);
-+                    if (levels.length == 0) {
++                    List<String> names = writePools(path, host, protocol);
++                    if (names.isEmpty()) {
 +                        return UNKNOWN;
 +                    }
-+                    pools = levels[0].getPoolList().stream().map(costModule::getPoolCostInfo)
++                    pools = names.stream().map(costModule::getPoolCostInfo)
 +                          .filter(Objects::nonNull).map(PoolCostInfo::getSpaceInfo)
 +                          .collect(Collectors.toList());
 +                }
 +            } catch (IllegalArgumentException e) {
-+                return UNKNOWN; // no storage, net or link group unit matches
++                return UNKNOWN; // no storage or net unit matches
 +            } catch (RemoteAccessException e) {
 +                pools = List.of();
 +            }
@@ -701,10 +789,10 @@ index 0000000..48b82ba
 +}
 diff --git a/modules/dcache/src/test/java/org/dcache/space/CapacityTest.java b/modules/dcache/src/test/java/org/dcache/space/CapacityTest.java
 new file mode 100644
-index 0000000..8e60b2b
+index 0000000..b9fb6e5
 --- /dev/null
 +++ b/modules/dcache/src/test/java/org/dcache/space/CapacityTest.java
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,239 @@
 +package org.dcache.space;
 +
 +import static org.hamcrest.MatcherAssert.assertThat;
@@ -712,6 +800,7 @@ index 0000000..8e60b2b
 +import static org.junit.Assert.assertThrows;
 +import static org.mockito.ArgumentMatchers.any;
 +import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.isNull;
 +import static org.mockito.Mockito.mock;
 +import static org.mockito.Mockito.when;
 +
@@ -721,15 +810,20 @@ index 0000000..8e60b2b
 +import diskCacheV111.poolManager.PoolPreferenceLevel;
 +import diskCacheV111.poolManager.PoolSelectionUnit;
 +import diskCacheV111.poolManager.PoolSelectionUnit.DirectionType;
++import diskCacheV111.poolManager.PoolSelectionUnit.SelectionLinkGroup;
++import diskCacheV111.services.space.LinkGroup;
 +import diskCacheV111.pools.PoolCostInfo;
 +import diskCacheV111.services.space.Space;
 +import diskCacheV111.services.space.SpaceState;
++import diskCacheV111.services.space.message.GetLinkGroupsMessage;
 +import diskCacheV111.util.AccessLatency;
 +import diskCacheV111.util.CacheException;
 +import diskCacheV111.util.RetentionPolicy;
 +import diskCacheV111.vehicles.GenericStorageInfo;
 +import java.util.List;
++import java.util.Map;
 +import java.util.Optional;
++import org.dcache.cells.CellStub;
 +import org.dcache.poolmanager.PoolMonitor;
 +import org.dcache.vehicles.FileAttributes;
 +import org.junit.Test;
@@ -766,6 +860,31 @@ index 0000000..8e60b2b
 +
 +        assertThat(capacity.getTotalSpace(), is(2000L));
 +        assertThat(capacity.getFreeSpace(), is(300L));
++    }
++
++    @Test
++    public void shouldSumWritePoolsOfLinkGroupOfWriteToken() throws Exception {
++        givenPools(pool("pool1", 1000, 100, 50), pool("pool2", 2000, 300, 0));
++        givenLinkGroupWritePools("lg", "pool2");
++        Capacity.Provider provider = provider("pools", "");
++        provider.setSpaceReservation(true);
++        provider.setSpaceManager(spaceManager(42, "lg"));
++
++        Capacity capacity = provider.get(path("42"), "192.0.2.1", "Xrootd/5");
++
++        assertThat(capacity.getTotalSpace(), is(2000L));
++    }
++
++    @Test
++    public void shouldPreferLinkGroupsWithoutWriteToken() throws Exception {
++        givenPools(pool("pool1", 1000, 100, 50), pool("pool2", 2000, 300, 0));
++        givenLinkGroupWritePools("lg", "pool2");
++        Capacity.Provider provider = provider("pools", "");
++        provider.setSpaceReservation(true);
++
++        Capacity capacity = provider.get(path(null), "192.0.2.1", "Xrootd/5");
++
++        assertThat(capacity.getTotalSpace(), is(2000L));
 +    }
 +
 +    @Test
@@ -853,13 +972,43 @@ index 0000000..8e60b2b
 +    }
 +
 +    private void givenWritePools(String... pools) {
++        PoolPreferenceLevel[] levels = levels(pools);
++        PoolSelectionUnit psu = mock(PoolSelectionUnit.class);
++        when(psu.match(eq(DirectionType.WRITE), eq("192.0.2.1"), eq("Xrootd/5"), any(), isNull(),
++              any())).thenReturn(levels);
++        when(poolMonitor.getPoolSelectionUnit()).thenReturn(psu);
++    }
++
++    /**
++     * Pools written to only in the given link group.
++     */
++    private void givenLinkGroupWritePools(String linkGroup, String... pools) {
++        PoolPreferenceLevel[] levels = levels(pools);
++        SelectionLinkGroup group = mock(SelectionLinkGroup.class);
++        PoolSelectionUnit psu = mock(PoolSelectionUnit.class);
++        when(psu.getLinkGroups()).thenReturn(Map.of(linkGroup, group));
++        when(psu.match(eq(DirectionType.WRITE), eq("192.0.2.1"), eq("Xrootd/5"), any(), any(),
++              any())).thenReturn(new PoolPreferenceLevel[0]);
++        when(psu.match(eq(DirectionType.WRITE), eq("192.0.2.1"), eq("Xrootd/5"), any(),
++              eq(linkGroup), any())).thenReturn(levels);
++        when(poolMonitor.getPoolSelectionUnit()).thenReturn(psu);
++    }
++
++    private static PoolPreferenceLevel[] levels(String... pools) {
 +        PoolPreferenceLevel level = mock(PoolPreferenceLevel.class);
 +        when(level.getPoolList()).thenReturn(List.of(pools));
-+        PoolSelectionUnit psu = mock(PoolSelectionUnit.class);
-+        when(psu.match(eq(DirectionType.WRITE), eq("192.0.2.1"), eq("Xrootd/5"), any(), any(),
-+              any())).thenReturn(pools.length == 0
-+              ? new PoolPreferenceLevel[0] : new PoolPreferenceLevel[]{level});
-+        when(poolMonitor.getPoolSelectionUnit()).thenReturn(psu);
++        return pools.length == 0 ? new PoolPreferenceLevel[0] : new PoolPreferenceLevel[]{level};
++    }
++
++    private CellStub spaceManager(long linkGroupId, String name) throws Exception {
++        LinkGroup group = new LinkGroup();
++        group.setId(linkGroupId);
++        group.setName(name);
++        GetLinkGroupsMessage reply = new GetLinkGroupsMessage();
++        reply.setLinkGroups(List.of(group));
++        CellStub stub = mock(CellStub.class);
++        when(stub.sendAndWait(any(GetLinkGroupsMessage.class))).thenReturn(reply);
++        return stub;
 +    }
 +
 +    private static FileAttributes path(String writeToken) {
@@ -879,15 +1028,15 @@ index 0000000..8e60b2b
 +    }
 +
 +    static Space space(long id, long size, long used, long allocated) {
-+        return new Space(id, null, null, RetentionPolicy.REPLICA, AccessLatency.ONLINE, 1, size,
++        return new Space(id, null, null, RetentionPolicy.REPLICA, AccessLatency.ONLINE, id, size,
 +              0, null, "test", SpaceState.RESERVED, used, allocated);
 +    }
 +}
 diff --git a/skel/share/defaults/dcache.properties b/skel/share/defaults/dcache.properties
-index 44fa2b2..6eb3725 100644
+index 44fa2b2..95e3283 100644
 --- a/skel/share/defaults/dcache.properties
 +++ b/skel/share/defaults/dcache.properties
-@@ -1012,6 +1012,18 @@ dcache.authn.ciphers = DISABLE_RFC_7540_BANNED_CIPHERS, ENABLE_WEAK_CIPHERS_FOR_
+@@ -1012,6 +1012,22 @@ dcache.authn.ciphers = DISABLE_RFC_7540_BANNED_CIPHERS, ENABLE_WEAK_CIPHERS_FOR_
  #
  (one-of?true|false)dcache.enable.space-reservation=true
  
@@ -896,7 +1045,11 @@ index 44fa2b2..6eb3725 100644
 +#   namespace:   a fixed size of 1 EiB
 +#   pools:       total and free (incl. removable) space of the online pools
 +#                that files in the queried path are written to, or of all
-+#                online pools for NFS; 1 EiB if no write link matches
++#                online pools for NFS; 1 EiB if no write link matches. With
++#                space reservation, these are the pools of the link group of
++#                the WriteToken or, without one, of a matching link group, as
++#                if spacemanager.enable.unreserved-uploads-to-linkgroups were
++#                true, before links outside link groups
 +#   reservation: size and available space of the space reservation given
 +#                by the WriteToken tag of the queried path, or as pools for
 +#                paths without one; NFS reports nfs.capacity.reservation
