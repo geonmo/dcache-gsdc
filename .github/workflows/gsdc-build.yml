@@ -23,6 +23,14 @@ on:
         description: 'Build the next site release (e.g. -3_GSDC after -2_GSDC) even if one exists'
         type: boolean
         default: false
+      openjdk_version:
+        description: 'java-21-openjdk version to put in the image (e.g. 21.0.13.1.2). Empty: newest in the builder image repos.'
+        required: false
+        default: ''
+      builder_image:
+        description: 'Image whose repos provide java-21-openjdk (e.g. registry.access.redhat.com/ubi10/ubi-minimal). Empty: almalinux:10-minimal.'
+        required: false
+        default: ''
 
 env:
   SERIES: '11.2'
@@ -218,7 +226,10 @@ jobs:
         with:
           context: context
           push: true
-          build-args: DCACHE_VERSION=${{ env.VERSION }}
+          build-args: |
+            DCACHE_VERSION=${{ env.VERSION }}
+            OPENJDK_VERSION=${{ inputs.openjdk_version }}
+            ${{ inputs.builder_image && format('BUILDER_IMAGE={0}', inputs.builder_image) || '' }}
           tags: |
             ${{ env.IMAGE }}:${{ env.VERSION }}-${{ env.BUILD_ID }}${{ env.LOCAL_VERSION }}
             ${{ needs.detect.outputs.latest == 'true' && format('{0}:{1}-gsdc', env.IMAGE, env.SERIES) || '' }}
@@ -230,10 +241,15 @@ jobs:
       - name: Create release
         run: |
           release="${VERSION}-${BUILD_ID}${LOCAL_VERSION}"
+          container=$(docker create "$IMAGE:$release")
+          openjdk=$(docker cp "$container:/jlink-runtime/OPENJDK_RPM" - | tar -xO)
+          docker rm "$container" > /dev/null
           {
             echo "dCache $VERSION with the GSDC site patches:"
             echo
             cat "$(find packages -name patches.txt)"
+            echo
+            echo "Java runtime of the image: \`$openjdk\`"
             echo
             echo "Container image: \`$IMAGE:$release\`"
           } > notes.md

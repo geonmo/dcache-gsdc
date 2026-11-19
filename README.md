@@ -29,6 +29,21 @@ An official release with a higher version (e.g. `11.2.11-1`) replaces the site
 build when installed. If the patches no longer apply to a new release, the
 workflow opens an issue instead of building.
 
+## Java runtime
+
+The official image has a Java runtime made with jlink from the OpenJDK that
+AlmaLinux had when the image was built. `container/Dockerfile` makes this
+runtime again, with the same modules, from the newest `java-21-openjdk` (the
+AlmaLinux rebuild of Red Hat's OpenJDK), so that the image gets OpenJDK
+security fixes released after the official image. The RPM it was made from is
+in `/jlink-runtime/OPENJDK_RPM` and in the release notes.
+
+To require a specific OpenJDK build, run the workflow by hand with
+*openjdk_version* (e.g. `21.0.13.1.2`). If AlmaLinux does not have it yet, also
+set *builder_image* to an image whose repos do, e.g.
+`registry.access.redhat.com/ubi10/ubi-minimal`. The build fails if the version
+is not found.
+
 ## Updating the patches
 
 ```console
