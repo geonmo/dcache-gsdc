@@ -1,0 +1,309 @@
+From ca30474385f090546b0ccb8910471a001f84b77d Mon Sep 17 00:00:00 2001
+From: Geonmo Ryu <geonmo@kisti.re.kr>
+Date: Thu, 26 Nov 2026 14:51:12 +0900
+Subject: [PATCH 2/2] pool: abort the HTTP connection when an HTTP-TPC pull is
+ cancelled
+
+Motivation:
+The remote-HTTP mover copies the GET response body with
+HttpEntity#writeTo.  If the write to the replica fails, e.g. with
+ClosedByInterruptException after the mover was cancelled, writeTo
+closes the content stream, which reads the rest of the body from the
+remote server.  The mover stays CANCELED until the whole file has
+arrived and holds an HTTP-TPC connection slot.
+
+Modification:
+Copy the body from the entity's content stream.  If the copy fails,
+abort the connection (ConnectionReleaseTrigger#abortConnection)
+instead of closing the stream.
+
+Result:
+A cancelled HTTP-TPC pull ends promptly and releases its connection.
+
+(backport of dCache/dcache#8327 for the GSDC site build)
+
+Fixes: #8301
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Geonmo Ryu <geonmo@kisti.re.kr>
+---
+ .../RemoteHttpDataTransferProtocol.java       |  29 ++-
+ .../RemoteHttpDataTransferProtocolTest.java   | 200 ++++++++++++++++++
+ 2 files changed, 228 insertions(+), 1 deletion(-)
+ create mode 100644 modules/dcache/src/test/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocolTest.java
+
+diff --git a/modules/dcache/src/main/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocol.java b/modules/dcache/src/main/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocol.java
+index 8b2e5a14ed..6803256ff7 100644
+--- a/modules/dcache/src/main/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocol.java
++++ b/modules/dcache/src/main/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocol.java
+@@ -14,12 +14,15 @@ import static org.dcache.util.Strings.describeSize;
+ import static org.dcache.util.Strings.toThreeSigFig;
+ import static org.dcache.util.TimeUtils.describeDuration;
+ 
++import com.google.common.annotations.VisibleForTesting;
+ import diskCacheV111.util.CacheException;
+ import diskCacheV111.util.ThirdPartyTransferFailedCacheException;
+ import diskCacheV111.vehicles.IpProtocolInfo;
+ import diskCacheV111.vehicles.ProtocolInfo;
+ import diskCacheV111.vehicles.RemoteHttpDataTransferProtocolInfo;
+ import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
+ import java.net.ConnectException;
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+@@ -56,6 +59,7 @@ import org.apache.http.client.methods.HttpGet;
+ import org.apache.http.client.methods.HttpHead;
+ import org.apache.http.client.methods.HttpPut;
+ import org.apache.http.client.protocol.HttpClientContext;
++import org.apache.http.conn.ConnectionReleaseTrigger;
+ import org.apache.http.impl.client.CloseableHttpClient;
+ import org.apache.http.impl.conn.ConnectionShutdownException;
+ import org.apache.http.protocol.HttpContext;
+@@ -405,7 +409,7 @@ public class RemoteHttpDataTransferProtocol implements MoverProtocol,
+                       && response.getStatusLine().getStatusCode() < 300 && length > -1) {
+                     _expectedTransferSize = length;
+                 }
+-                entity.writeTo(Channels.newOutputStream(_channel));
++                receiveBody(entity, Channels.newOutputStream(_channel));
+             } catch (SocketTimeoutException e) {
+                 String message = "socket timeout on GET (received "
+                       + describeSize(_channel.getBytesTransferred()) + " of data; "
+@@ -448,6 +452,29 @@ public class RemoteHttpDataTransferProtocol implements MoverProtocol,
+         }
+     }
+ 
++    /**
++     * Copy the response body.  Unlike {@link HttpEntity#writeTo}, the content stream is not closed
++     * if the copy fails (e.g., because the mover was cancelled): closing it would read the rest of
++     * the body.  Instead, the connection is shut down, so that it is neither read to the end nor
++     * reused.
++     */
++    @VisibleForTesting
++    static void receiveBody(HttpEntity entity, OutputStream out) throws IOException {
++        InputStream in = entity.getContent();
++        try {
++            in.transferTo(out);
++        } catch (IOException | RuntimeException e) {
++            if (in instanceof ConnectionReleaseTrigger) {
++                try {
++                    ((ConnectionReleaseTrigger) in).abortConnection();
++                } catch (IOException suppressed) {
++                    e.addSuppressed(suppressed);
++                }
++            }
++            throw e;
++        }
++    }
++
+     private Optional<InetSocketAddress> remoteAddress() {
+         HttpContext context = getContext();
+         if (context == null) {
+diff --git a/modules/dcache/src/test/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocolTest.java b/modules/dcache/src/test/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocolTest.java
+new file mode 100644
+index 0000000000..579513aaba
+--- /dev/null
++++ b/modules/dcache/src/test/java/org/dcache/pool/movers/RemoteHttpDataTransferProtocolTest.java
+@@ -0,0 +1,200 @@
++/* dCache - http://www.dcache.org/
++ *
++ * Copyright (C) 2026 Deutsches Elektronen-Synchrotron
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as
++ * published by the Free Software Foundation, either version 3 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++package org.dcache.pool.movers;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.lessThan;
++import static org.junit.Assert.fail;
++import static org.mockito.BDDMockito.given;
++import static org.mockito.Mockito.mock;
++
++import com.sun.net.httpserver.HttpServer;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.nio.channels.ClosedByInterruptException;
++import java.nio.charset.StandardCharsets;
++import java.util.Arrays;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import org.apache.http.HttpEntity;
++import org.apache.http.client.methods.CloseableHttpResponse;
++import org.apache.http.client.methods.HttpGet;
++import org.apache.http.conn.ConnectionReleaseTrigger;
++import org.apache.http.impl.client.CloseableHttpClient;
++import org.apache.http.impl.client.HttpClients;
++import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
++import org.junit.Test;
++
++public class RemoteHttpDataTransferProtocolTest {
++
++    private static final int BODY_SIZE = 1_000_000;
++
++    /**
++     * A response body of {@link #BODY_SIZE} bytes that records how much of it was read and whether
++     * it was closed or its connection aborted.
++     */
++    private static class Body extends InputStream implements ConnectionReleaseTrigger {
++
++        private int read;
++        private boolean closed;
++        private boolean aborted;
++
++        @Override
++        public int read() {
++            if (read == BODY_SIZE) {
++                return -1;
++            }
++            read++;
++            return 0;
++        }
++
++        @Override
++        public int read(byte[] b, int off, int len) throws IOException {
++            if (read == BODY_SIZE) {
++                return -1;
++            }
++            int n = Math.min(len, BODY_SIZE - read);
++            Arrays.fill(b, off, off + n, (byte) 0);
++            read += n;
++            return n;
++        }
++
++        @Override
++        public void close() {
++            closed = true;
++        }
++
++        @Override
++        public void releaseConnection() {
++        }
++
++        @Override
++        public void abortConnection() {
++            aborted = true;
++        }
++    }
++
++    private static final OutputStream FAILING_OUTPUT = new OutputStream() {
++        @Override
++        public void write(int b) throws IOException {
++            throw new ClosedByInterruptException();
++        }
++
++        @Override
++        public void write(byte[] b, int off, int len) throws IOException {
++            throw new ClosedByInterruptException();
++        }
++    };
++
++    private static HttpEntity entityWith(InputStream content) throws IOException {
++        HttpEntity entity = mock(HttpEntity.class);
++        given(entity.getContent()).willReturn(content);
++        return entity;
++    }
++
++    @Test
++    public void shouldCopyWholeBody() throws Exception {
++        byte[] data = new byte[BODY_SIZE];
++        data[BODY_SIZE - 1] = 42;
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++
++        RemoteHttpDataTransferProtocol.receiveBody(entityWith(new ByteArrayInputStream(data)), out);
++
++        assertThat(out.toByteArray(), equalTo(data));
++    }
++
++    @Test
++    public void shouldAbortConnectionWithoutDrainingBodyWhenWriteFails() throws Exception {
++        Body body = new Body();
++
++        try {
++            RemoteHttpDataTransferProtocol.receiveBody(entityWith(body), FAILING_OUTPUT);
++            fail("expected failure");
++        } catch (ClosedByInterruptException expected) {
++        }
++
++        assertThat(body.aborted, equalTo(true));
++        assertThat(body.closed, equalTo(false));
++        assertThat(body.read, lessThan(BODY_SIZE));
++    }
++
++    @Test
++    public void shouldAbortConnectionWithoutClosingBodyWhenReadFails() throws Exception {
++        Body body = new Body() {
++            @Override
++            public int read(byte[] b, int off, int len) throws IOException {
++                throw new IOException("connection reset");
++            }
++        };
++
++        try {
++            RemoteHttpDataTransferProtocol.receiveBody(entityWith(body),
++                  new ByteArrayOutputStream());
++            fail("expected failure");
++        } catch (IOException expected) {
++        }
++
++        assertThat(body.aborted, equalTo(true));
++        assertThat(body.closed, equalTo(false));
++    }
++
++    @Test
++    public void shouldShutDownHttpConnectionWhenWriteFails() throws Exception {
++        byte[] start = "some file content".getBytes(StandardCharsets.UTF_8);
++        CountDownLatch release = new CountDownLatch(1);
++        HttpServer server = HttpServer.create(
++              new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
++        server.createContext("/large", e -> {
++            try {
++                e.sendResponseHeaders(200, BODY_SIZE);
++                e.getResponseBody().write(start);
++                e.getResponseBody().flush();
++                release.await(30, TimeUnit.SECONDS);
++            } catch (InterruptedException ignored) {
++            } finally {
++                e.close();
++            }
++        });
++        server.start();
++        PoolingHttpClientConnectionManager manager = new PoolingHttpClientConnectionManager();
++
++        try (CloseableHttpClient client = HttpClients.custom()
++              .setConnectionManager(manager).build();
++              CloseableHttpResponse response = client.execute(new HttpGet(
++                    "http://127.0.0.1:" + server.getAddress().getPort() + "/large"))) {
++            try {
++                RemoteHttpDataTransferProtocol.receiveBody(response.getEntity(), FAILING_OUTPUT);
++                fail("expected failure");
++            } catch (ClosedByInterruptException expected) {
++            }
++
++            // The connection is neither leased (being read) nor kept for reuse.
++            assertThat(manager.getTotalStats().getLeased(), equalTo(0));
++            assertThat(manager.getTotalStats().getAvailable(), equalTo(0));
++        } finally {
++            release.countDown();
++            server.stop(0);
++        }
++    }
++}
+-- 
+2.52.0
+
